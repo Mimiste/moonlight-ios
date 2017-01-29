@@ -67,6 +67,7 @@
             [dragTimer invalidate];
             dragTimer = nil;
         }
+        preventNextTouchRelease = false;
     }
 }
 
@@ -104,6 +105,8 @@
                     touchLocation = currentLocation;
                 }
             }
+            
+            preventNextTouchRelease = false;
         } else if ([[event allTouches] count] == 2) {
             CGPoint firstLocation = [[[[event allTouches] allObjects] objectAtIndex:0] locationInView:self];
             CGPoint secondLocation = [[[[event allTouches] allObjects] objectAtIndex:1] locationInView:self];
@@ -114,6 +117,8 @@
             }
             touchMoved = true;
             touchLocation = avgLocation;
+            
+            preventNextTouchRelease = false;
         }
     }
     
