@@ -16,9 +16,8 @@
 #define SYSBARBUTTON(ITEM, SELECTOR) [[UIBarButtonItem alloc] initWithBarButtonSystemItem:ITEM target:self action:SELECTOR]
 #define SYSBARBUTTON_TARGET(ITEM, TARGET, SELECTOR) [[UIBarButtonItem alloc] initWithBarButtonSystemItem:ITEM target:TARGET action:SELECTOR]
 
-
 @implementation StreamView {
-    CGPoint touchLocation;
+    CGPoint touchLocation, originalLocation;
     BOOL touchMoved;
     OnScreenControls* onScreenControls;
     
@@ -28,9 +27,6 @@
     float xDeltaFactor;
     float yDeltaFactor;
     float screenFactor;
-    
-    BOOL preventNextTouchRelease;
-    NSTimer* preventNextTouchReleaseTimer;
 }
 
 - (void) setMouseDeltaFactors:(float)x y:(float)y {
@@ -54,11 +50,16 @@
     }
 }
 
+- (Boolean)isConfirmedMove:(CGPoint)currentPoint from:(CGPoint)originalPoint {
+    // Movements of greater than 20 pixels are considered confirmed
+    return hypotf(originalPoint.x - currentPoint.x, originalPoint.y - currentPoint.y) >= 20;
+}
+
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
     Log(LOG_D, @"Touch down");
     if (![onScreenControls handleTouchDownEvent:touches]) {
         UITouch *touch = [[event allTouches] anyObject];
-        touchLocation = [touch locationInView:self];
+        originalLocation = touchLocation = [touch locationInView:self];
         touchMoved = false;
         if ([[event allTouches] count] == 1 && !isDragging) {
             dragTimer = [NSTimer scheduledTimerWithTimeInterval:0.650
@@ -66,12 +67,7 @@
                                                    selector:@selector(onDragStart:)
                                                    userInfo:nil
                                                     repeats:NO];
-        } else if ([[event allTouches] count] == 3 && !isDragging) {
-            //Invalidate the drag timer, the keyboard will be opened on release
-            [dragTimer invalidate];
-            dragTimer = nil;
         }
-        preventNextTouchRelease = false;
     }
 }
 
@@ -80,10 +76,6 @@
         isDragging = true;
         LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
     }
-}
-
-- (void)onCancelPreventNextTouch:(NSTimer*)timer {
-    preventNextTouchRelease = false;
 }
 
 - (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
@@ -105,12 +97,15 @@
                 
                 if (deltaX != 0 || deltaY != 0) {
                     LiSendMouseMoveEvent(deltaX, deltaY);
-                    touchMoved = true;
                     touchLocation = currentLocation;
+                    
+                    // If we've moved far enough to confirm this wasn't just human/machine error,
+                    // mark it as such.
+                    if ([self isConfirmedMove:touchLocation from:originalLocation]) {
+                        touchMoved = true;
+                    }
                 }
             }
-            
-            preventNextTouchRelease = false;
         } else if ([[event allTouches] count] == 2) {
             CGPoint firstLocation = [[[[event allTouches] allObjects] objectAtIndex:0] locationInView:self];
             CGPoint secondLocation = [[[[event allTouches] allObjects] objectAtIndex:1] locationInView:self];
@@ -119,10 +114,18 @@
             if (touchLocation.y != avgLocation.y) {
                 LiSendScrollEvent(avgLocation.y - touchLocation.y);
             }
-            touchMoved = true;
-            touchLocation = avgLocation;
+
+            // If we've moved far enough to confirm this wasn't just human/machine error,
+            // mark it as such.
+            if ([self isConfirmedMove:firstLocation from:originalLocation]) {
+                touchMoved = true;
+            }
             
-            preventNextTouchRelease = false;
+            touchLocation = avgLocation;
+        } else if ([[event allTouches] count] == 3 && !isDragging) {
+            //Invalidate the drag timer, the keyboard will be opened on release
+            [dragTimer invalidate];
+            dragTimer = nil;
         }
     }
     
@@ -133,7 +136,7 @@
     if (![onScreenControls handleTouchUpEvent:touches]) {
         [dragTimer invalidate];
         dragTimer = nil;
-        if (!touchMoved && !preventNextTouchRelease) {
+        if (!touchMoved) {
             if ([[event allTouches] count]  == 3) {
                 Log(LOG_D, @"Opening the keyboard");
                 //Prepare the textbox used to capture entered characters
@@ -141,14 +144,6 @@
                 _textToSend.text = @"0";
                 [_textToSend becomeFirstResponder];
                 [_textToSend addTarget:self action:@selector(onKeyboardPressed:) forControlEvents:UIControlEventEditingChanged];
-                
-                //This timer is usefull to prevent to send a touch if you do not release the 3 fingers at the exact same time
-                preventNextTouchRelease = true;
-                preventNextTouchReleaseTimer = [NSTimer scheduledTimerWithTimeInterval:0.250
-                                                             target:self
-                                                           selector:@selector(onCancelPreventNextTouch:)
-                                                           userInfo:nil
-                                                            repeats:NO];
             } else if ([[event allTouches] count]  == 2) {
                 Log(LOG_D, @"Sending right mouse button press");
                 
@@ -158,7 +153,7 @@
                 usleep(100 * 1000);
                 
                 LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
-            } else if ([[event allTouches] count]  == 1){
+            } else {
                 if (!isDragging){
                     Log(LOG_D, @"Sending left mouse button press");
                     
@@ -175,13 +170,26 @@
             isDragging = false;
             LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
         }
+        
+        // We we're moving from 2+ touches to 1. Synchronize the current position
+        // of the active finger so we don't jump unexpectedly on the next touchesMoved
+        // callback when finger 1 switches on us.
+        if ([[event allTouches] count] - [touches count] == 1) {
+            NSMutableSet *activeSet = [[NSMutableSet alloc] initWithCapacity:[[event allTouches] count]];
+            [activeSet unionSet:[event allTouches]];
+            [activeSet minusSet:touches];
+            touchLocation = [[activeSet anyObject] locationInView:self];
+            
+            // Mark this touch as moved so we don't send a left mouse click if the user
+            // right clicks without moving their other finger.
+            touchMoved = true;
+        }
     }
 }
 
 - (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event {
 }
 
-//Detect and send the ENTER key
 - (BOOL)textFieldShouldReturn:(UITextField *)textToSend {
     LiSendKeyboardEvent(0x0d, KEY_ACTION_DOWN, 0);
     usleep(100 * 1000);
@@ -199,7 +207,11 @@
     } else {
         //Translate the keycode of the last entered character
         short keyCode = [textToSend.text characterAtIndex:1];
-        keyCodeStructure = translateKeycode(keyCode);
+        if (keyCode != 8226) { // bullet hides the keyboard
+            keyCodeStructure = translateKeycode(keyCode);
+        } else {
+            [_textToSend endEditing:YES];
+        }
     }
     //Send the keycode
     LiSendKeyboardEvent(keyCodeStructure.keycode, KEY_ACTION_DOWN, keyCodeStructure.modifier);
@@ -231,3 +243,4 @@
 }
 
 @end
+

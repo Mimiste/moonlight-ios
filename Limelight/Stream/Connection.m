@@ -10,6 +10,7 @@
 
 #import <AudioUnit/AudioUnit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 #include "Limelight.h"
 #include "opus.h"
@@ -45,6 +46,12 @@ static int audioBufferQueueLength;
 static AudioComponentInstance audioUnit;
 static VideoDecoderRenderer* renderer;
 
+int DrDecoderSetup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags)
+{
+    [renderer setupWithVideoFormat:videoFormat];
+    return 0;
+}
+
 int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit)
 {
     int offset = 0;
@@ -65,7 +72,7 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit)
     return [renderer submitDecodeBuffer:data length:decodeUnit->fullLength];
 }
 
-void ArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig)
+int ArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig, void* context, int flags)
 {
     int err;
     
@@ -101,6 +108,7 @@ void ArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig)
     
     if (status) {
         Log(LOG_E, @"Unable to instantiate new AudioComponent: %d", (int32_t)status);
+        return status;
     }
     
     AudioStreamBasicDescription audioFormat = {0};
@@ -122,6 +130,7 @@ void ArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig)
                                   sizeof(audioFormat));
     if (status) {
         Log(LOG_E, @"Unable to set audio unit to input: %d", (int32_t)status);
+        return status;
     }
     
     AURenderCallbackStruct callbackStruct = {0};
@@ -136,17 +145,22 @@ void ArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig)
                                   sizeof(callbackStruct));
     if (status) {
         Log(LOG_E, @"Unable to set audio unit callback: %d", (int32_t)status);
+        return status;
     }
     
     status = AudioUnitInitialize(audioUnit);
     if (status) {
         Log(LOG_E, @"Unable to initialize audioUnit: %d", (int32_t)status);
+        return status;
     }
     
     status = AudioOutputUnitStart(audioUnit);
     if (status) {
         Log(LOG_E, @"Unable to start audioUnit: %d", (int32_t)status);
+        return status;
     }
+    
+    return status;
 }
 
 void ArCleanup(void)
@@ -261,6 +275,14 @@ void ClDisplayTransientMessage(const char* message)
     [_callbacks displayTransientMessage: message];
 }
 
+void ClLogMessage(const char* format, ...)
+{
+    va_list va;
+    va_start(va, format);
+    vfprintf(stderr, format, va);
+    va_end(va);
+}
+
 -(void) terminate
 {
     // We dispatch this async to get out because this can be invoked
@@ -299,6 +321,12 @@ void ClDisplayTransientMessage(const char* message)
     _streamConfig.fps = config.frameRate;
     _streamConfig.bitrate = config.bitRate;
     
+    // On iOS 11, we can use HEVC if the server supports encoding it
+    // and this device has hardware decode for it (A9 and later)
+    if (@available(iOS 11.0, *)) {
+        _streamConfig.supportsHevc = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC);
+    }
+    
     // FIXME: We should use 1024 when streaming remotely
     _streamConfig.packetSize = 1292;
     
@@ -308,7 +336,11 @@ void ClDisplayTransientMessage(const char* message)
     memcpy(_streamConfig.remoteInputAesIv, &riKeyId, sizeof(riKeyId));
     
     LiInitializeVideoCallbacks(&_drCallbacks);
+    _drCallbacks.setup = DrDecoderSetup;
     _drCallbacks.submitDecodeUnit = DrSubmitDecodeUnit;
+    
+    // RFI doesn't work properly with HEVC on iOS 11 with an iPhone SE (at least)
+    _drCallbacks.capabilities = CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC;
     
     LiInitializeAudioCallbacks(&_arCallbacks);
     _arCallbacks.init = ArInit;
@@ -323,6 +355,7 @@ void ClDisplayTransientMessage(const char* message)
     _clCallbacks.connectionTerminated = ClConnectionTerminated;
     _clCallbacks.displayMessage = ClDisplayMessage;
     _clCallbacks.displayTransientMessage = ClDisplayTransientMessage;
+    _clCallbacks.logMessage = ClLogMessage;
     
     return self;
 }
@@ -416,6 +449,7 @@ static OSStatus playbackCallback(void *inRefCon,
                       &_clCallbacks,
                       &_drCallbacks,
                       &_arCallbacks,
+                      NULL, 0,
                       NULL, 0);
     [initLock unlock];
 }
