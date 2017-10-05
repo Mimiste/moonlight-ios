@@ -847,7 +847,6 @@
 						TestTargetID = FB290CED19B2C406004C83CF;
 					};
 					FB290CED19B2C406004C83CF = {
-						DevelopmentTeam = W39L4YTQ9K;
 						LastSwiftMigration = 0800;
 					};
 				};
