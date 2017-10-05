@@ -13,6 +13,10 @@
 #import "ControllerSupport.h"
 #import "keyboard_translation.h"
 
+#define SYSBARBUTTON(ITEM, SELECTOR) [[UIBarButtonItem alloc] initWithBarButtonSystemItem:ITEM target:self action:SELECTOR]
+#define SYSBARBUTTON_TARGET(ITEM, TARGET, SELECTOR) [[UIBarButtonItem alloc] initWithBarButtonSystemItem:ITEM target:TARGET action:SELECTOR]
+
+
 @implementation StreamView {
     CGPoint touchLocation;
     BOOL touchMoved;
@@ -202,6 +206,28 @@
     usleep(100 * 1000);
     LiSendKeyboardEvent(keyCodeStructure.keycode, KEY_ACTION_UP, keyCodeStructure.modifier);
     textToSend.text = @"0";
+}
+
+- (void)textFieldDidBeginEditing:(UITextField *)sender {
+    [sender.undoManager disableUndoRegistration];
+}
+
+- (BOOL)canPerformAction:(SEL)action withSender:(UITextField *)sender {
+    if (action == @selector(paste:) ||
+        action == @selector(cut:) ||
+        action == @selector(copy:) ||
+        action == @selector(select:) ||
+        action == @selector(selectAll:) ||
+        action == @selector(delete:) ||
+        action == @selector(makeTextWritingDirectionLeftToRight:) ||
+        action == @selector(makeTextWritingDirectionRightToLeft:) ||
+        action == @selector(toggleBoldface:) ||
+        action == @selector(toggleItalics:) ||
+        action == @selector(toggleUnderline:)
+        ) {
+        return NO;
+    }
+    return [super canPerformAction:action withSender:sender];
 }
 
 @end
