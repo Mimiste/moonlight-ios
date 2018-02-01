@@ -18,7 +18,6 @@
     NSURLSession* _urlSession;
     NSString* _baseHTTPURL;
     NSString* _baseHTTPSURL;
-    NSString* _host;
     NSString* _uniqueId;
     NSString* _deviceName;
     NSData* _cert;
@@ -41,16 +40,25 @@ static const NSString* HTTPS_PORT = @"47984";
 
 - (id) initWithHost:(NSString*) host uniqueId:(NSString*) uniqueId deviceName:(NSString*) deviceName cert:(NSData*) cert {
     self = [super init];
-    _host = host;
     _uniqueId = uniqueId;
     _deviceName = deviceName;
     _cert = cert;
-    _baseHTTPURL = [NSString stringWithFormat:@"http://%@:%@", host, HTTP_PORT];
-    _baseHTTPSURL = [NSString stringWithFormat:@"https://%@:%@", host, HTTPS_PORT];
     _requestLock = dispatch_semaphore_create(0);
     _respData = [[NSMutableData alloc] init];
     NSURLSessionConfiguration* config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
     _urlSession = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+    
+    // If this is an IPv6 literal, we must properly enclose it in brackets
+    NSString* urlSafeHost;
+    if ([host containsString:@":"]) {
+        urlSafeHost = [NSString stringWithFormat:@"[%@]", host];
+    } else {
+        urlSafeHost = host;
+    }
+    
+    _baseHTTPURL = [NSString stringWithFormat:@"http://%@:%@", urlSafeHost, HTTP_PORT];
+    _baseHTTPSURL = [NSString stringWithFormat:@"https://%@:%@", urlSafeHost, HTTPS_PORT];
+    
     return self;
 }
 
@@ -159,8 +167,8 @@ static const NSString* HTTPS_PORT = @"47984";
     return [self createRequestFromString:urlString enableTimeout:TRUE];
 }
 
-- (NSURLRequest*) newLaunchRequest:(NSString*)appId width:(int)width height:(int)height refreshRate:(int)refreshRate rikey:(NSString*)rikey rikeyid:(int)rikeyid {
-    NSString* urlString = [NSString stringWithFormat:@"%@/launch?uniqueid=%@&appid=%@&mode=%dx%dx%d&additionalStates=1&sops=1&rikey=%@&rikeyid=%d", _baseHTTPSURL, _uniqueId, appId, width, height, refreshRate, rikey, rikeyid];
+- (NSURLRequest*) newLaunchRequest:(NSString*)appId width:(int)width height:(int)height refreshRate:(int)refreshRate rikey:(NSString*)rikey rikeyid:(int)rikeyid gamepadMask:(int)gamepadMask {
+    NSString* urlString = [NSString stringWithFormat:@"%@/launch?uniqueid=%@&appid=%@&mode=%dx%dx%d&additionalStates=1&sops=1&rikey=%@&rikeyid=%d&remoteControllersBitmap=%d&gcmap=%d", _baseHTTPSURL, _uniqueId, appId, width, height, refreshRate, rikey, rikeyid, gamepadMask, gamepadMask];
     // This blocks while the app is launching
     return [self createRequestFromString:urlString enableTimeout:FALSE];
 }

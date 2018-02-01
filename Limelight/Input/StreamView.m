@@ -51,8 +51,13 @@
 }
 
 - (Boolean)isConfirmedMove:(CGPoint)currentPoint from:(CGPoint)originalPoint {
+<<<<<<< HEAD
+    // Movements of greater than 10 pixels are considered confirmed
+    return hypotf(originalPoint.x - currentPoint.x, originalPoint.y - currentPoint.y) >= 10;
+=======
     // Movements of greater than 20 pixels are considered confirmed
     return hypotf(originalPoint.x - currentPoint.x, originalPoint.y - currentPoint.y) >= 20;
+>>>>>>> master
 }
 
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
@@ -80,8 +85,6 @@
 
 - (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
     if (![onScreenControls handleTouchMovedEvent:touches]) {
-        [dragTimer invalidate];
-        dragTimer = nil;
         if ([[event allTouches] count] == 1) {
             UITouch *touch = [[event allTouches] anyObject];
             CGPoint currentLocation = [touch locationInView:self];
@@ -136,6 +139,14 @@
     if (![onScreenControls handleTouchUpEvent:touches]) {
         [dragTimer invalidate];
         dragTimer = nil;
+<<<<<<< HEAD
+        if (isDragging) {
+            isDragging = false;
+            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+        }
+        else if (!touchMoved) {
+            if ([[event allTouches] count]  == 2) {
+=======
         if (!touchMoved) {
             if ([[event allTouches] count]  == 3) {
                 Log(LOG_D, @"Opening the keyboard");
@@ -145,6 +156,7 @@
                 [_textToSend becomeFirstResponder];
                 [_textToSend addTarget:self action:@selector(onKeyboardPressed:) forControlEvents:UIControlEventEditingChanged];
             } else if ([[event allTouches] count]  == 2) {
+>>>>>>> master
                 Log(LOG_D, @"Sending right mouse button press");
                 
                 LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_RIGHT);
@@ -166,9 +178,19 @@
                 LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
             }
         }
-        else if (isDragging) {
-            isDragging = false;
-            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+        
+        // We we're moving from 2+ touches to 1. Synchronize the current position
+        // of the active finger so we don't jump unexpectedly on the next touchesMoved
+        // callback when finger 1 switches on us.
+        if ([[event allTouches] count] - [touches count] == 1) {
+            NSMutableSet *activeSet = [[NSMutableSet alloc] initWithCapacity:[[event allTouches] count]];
+            [activeSet unionSet:[event allTouches]];
+            [activeSet minusSet:touches];
+            touchLocation = [[activeSet anyObject] locationInView:self];
+            
+            // Mark this touch as moved so we don't send a left mouse click if the user
+            // right clicks without moving their other finger.
+            touchMoved = true;
         }
         
         // We we're moving from 2+ touches to 1. Synchronize the current position

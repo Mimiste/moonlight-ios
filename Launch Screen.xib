@@ -31,7 +31,9 @@
                     <navigationItem key="navigationItem" id="rW0-BH-s7l">
                         <barButtonItem key="leftBarButtonItem" enabled="NO" id="d9R-Zo-Uml">
                             <button key="customView" opaque="NO" contentMode="center" contentHorizontalAlignment="center" contentVerticalAlignment="center" adjustsImageWhenDisabled="NO" lineBreakMode="middleTruncation" id="9JC-B5-BAE">
-                                <rect key="frame" x="20" y="0.0" width="109" height="32"/>
+
+                                <rect key="frame" x="20" y="-1" width="109" height="46"/>
+
                                 <autoresizingMask key="autoresizingMask" flexibleMaxX="YES" flexibleMaxY="YES"/>
                                 <fontDescription key="fontDescription" type="system" pointSize="16"/>
                                 <state key="normal" title="Moonlight" image="Logo">
