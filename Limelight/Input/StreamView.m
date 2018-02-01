@@ -51,13 +51,8 @@
 }
 
 - (Boolean)isConfirmedMove:(CGPoint)currentPoint from:(CGPoint)originalPoint {
-<<<<<<< HEAD
     // Movements of greater than 10 pixels are considered confirmed
     return hypotf(originalPoint.x - currentPoint.x, originalPoint.y - currentPoint.y) >= 10;
-=======
-    // Movements of greater than 20 pixels are considered confirmed
-    return hypotf(originalPoint.x - currentPoint.x, originalPoint.y - currentPoint.y) >= 20;
->>>>>>> master
 }
 
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
@@ -139,14 +134,6 @@
     if (![onScreenControls handleTouchUpEvent:touches]) {
         [dragTimer invalidate];
         dragTimer = nil;
-<<<<<<< HEAD
-        if (isDragging) {
-            isDragging = false;
-            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
-        }
-        else if (!touchMoved) {
-            if ([[event allTouches] count]  == 2) {
-=======
         if (!touchMoved) {
             if ([[event allTouches] count]  == 3) {
                 Log(LOG_D, @"Opening the keyboard");
@@ -156,7 +143,6 @@
                 [_textToSend becomeFirstResponder];
                 [_textToSend addTarget:self action:@selector(onKeyboardPressed:) forControlEvents:UIControlEventEditingChanged];
             } else if ([[event allTouches] count]  == 2) {
->>>>>>> master
                 Log(LOG_D, @"Sending right mouse button press");
                 
                 LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_RIGHT);
