@@ -292,7 +292,7 @@
                 limeController = [[Controller alloc] init];
                 limeController.playerIndex = i;
             }
-
+            
             [_controllers setObject:limeController forKey:[NSNumber numberWithInteger:controller.playerIndex]];
             
             Log(LOG_I, @"Assigning controller index: %d", i);

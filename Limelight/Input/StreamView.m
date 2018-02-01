@@ -11,6 +11,10 @@
 #import "OnScreenControls.h"
 #import "DataManager.h"
 #import "ControllerSupport.h"
+#import "keyboard_translation.h"
+
+#define SYSBARBUTTON(ITEM, SELECTOR) [[UIBarButtonItem alloc] initWithBarButtonSystemItem:ITEM target:self action:SELECTOR]
+#define SYSBARBUTTON_TARGET(ITEM, TARGET, SELECTOR) [[UIBarButtonItem alloc] initWithBarButtonSystemItem:ITEM target:TARGET action:SELECTOR]
 
 @implementation StreamView {
     CGPoint touchLocation, originalLocation;
@@ -47,8 +51,13 @@
 }
 
 - (Boolean)isConfirmedMove:(CGPoint)currentPoint from:(CGPoint)originalPoint {
+<<<<<<< HEAD
     // Movements of greater than 10 pixels are considered confirmed
     return hypotf(originalPoint.x - currentPoint.x, originalPoint.y - currentPoint.y) >= 10;
+=======
+    // Movements of greater than 20 pixels are considered confirmed
+    return hypotf(originalPoint.x - currentPoint.x, originalPoint.y - currentPoint.y) >= 20;
+>>>>>>> master
 }
 
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
@@ -116,6 +125,10 @@
             }
             
             touchLocation = avgLocation;
+        } else if ([[event allTouches] count] == 3 && !isDragging) {
+            //Invalidate the drag timer, the keyboard will be opened on release
+            [dragTimer invalidate];
+            dragTimer = nil;
         }
     }
     
@@ -126,12 +139,24 @@
     if (![onScreenControls handleTouchUpEvent:touches]) {
         [dragTimer invalidate];
         dragTimer = nil;
+<<<<<<< HEAD
         if (isDragging) {
             isDragging = false;
             LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
         }
         else if (!touchMoved) {
             if ([[event allTouches] count]  == 2) {
+=======
+        if (!touchMoved) {
+            if ([[event allTouches] count]  == 3) {
+                Log(LOG_D, @"Opening the keyboard");
+                //Prepare the textbox used to capture entered characters
+                _textToSend.delegate = self;
+                _textToSend.text = @"0";
+                [_textToSend becomeFirstResponder];
+                [_textToSend addTarget:self action:@selector(onKeyboardPressed:) forControlEvents:UIControlEventEditingChanged];
+            } else if ([[event allTouches] count]  == 2) {
+>>>>>>> master
                 Log(LOG_D, @"Sending right mouse button press");
                 
                 LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_RIGHT);
@@ -167,11 +192,77 @@
             // right clicks without moving their other finger.
             touchMoved = true;
         }
+        
+        // We we're moving from 2+ touches to 1. Synchronize the current position
+        // of the active finger so we don't jump unexpectedly on the next touchesMoved
+        // callback when finger 1 switches on us.
+        if ([[event allTouches] count] - [touches count] == 1) {
+            NSMutableSet *activeSet = [[NSMutableSet alloc] initWithCapacity:[[event allTouches] count]];
+            [activeSet unionSet:[event allTouches]];
+            [activeSet minusSet:touches];
+            touchLocation = [[activeSet anyObject] locationInView:self];
+            
+            // Mark this touch as moved so we don't send a left mouse click if the user
+            // right clicks without moving their other finger.
+            touchMoved = true;
+        }
     }
 }
 
 - (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event {
 }
 
+- (BOOL)textFieldShouldReturn:(UITextField *)textToSend {
+    LiSendKeyboardEvent(0x0d, KEY_ACTION_DOWN, 0);
+    usleep(100 * 1000);
+    LiSendKeyboardEvent(0x0d, KEY_ACTION_UP, 0);
+    return YES;
+}
+
+//Capture the keycode of the last entered character in the textToSend Textfield, translate it and send it to GFE
+-(void)onKeyboardPressed :(UITextField *)textToSend{
+    struct translatedKeycode keyCodeStructure;
+    if ([textToSend.text  isEqual: @""]){
+        //If the textfield is empty, send a BACKSPACE
+        keyCodeStructure.keycode = 8;
+        keyCodeStructure.modifier = 0;
+    } else {
+        //Translate the keycode of the last entered character
+        short keyCode = [textToSend.text characterAtIndex:1];
+        if (keyCode != 8226) { // bullet hides the keyboard
+            keyCodeStructure = translateKeycode(keyCode);
+        } else {
+            [_textToSend endEditing:YES];
+        }
+    }
+    //Send the keycode
+    LiSendKeyboardEvent(keyCodeStructure.keycode, KEY_ACTION_DOWN, keyCodeStructure.modifier);
+    usleep(100 * 1000);
+    LiSendKeyboardEvent(keyCodeStructure.keycode, KEY_ACTION_UP, keyCodeStructure.modifier);
+    textToSend.text = @"0";
+}
+
+- (void)textFieldDidBeginEditing:(UITextField *)sender {
+    [sender.undoManager disableUndoRegistration];
+}
+
+- (BOOL)canPerformAction:(SEL)action withSender:(UITextField *)sender {
+    if (action == @selector(paste:) ||
+        action == @selector(cut:) ||
+        action == @selector(copy:) ||
+        action == @selector(select:) ||
+        action == @selector(selectAll:) ||
+        action == @selector(delete:) ||
+        action == @selector(makeTextWritingDirectionLeftToRight:) ||
+        action == @selector(makeTextWritingDirectionRightToLeft:) ||
+        action == @selector(toggleBoldface:) ||
+        action == @selector(toggleItalics:) ||
+        action == @selector(toggleUnderline:)
+        ) {
+        return NO;
+    }
+    return [super canPerformAction:action withSender:sender];
+}
 
 @end
+
