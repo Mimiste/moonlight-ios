@@ -6,19 +6,28 @@
 //  Copyright (c) 2014 Moonlight Stream. All rights reserved.
 //
 
-#import <Foundation/Foundation.h>
-
 // Swift
-#import "Moonlight-Swift.h"
-@class Controller;
+#if !TARGET_OS_IPHONE
+#import "Gamepad.h"
+#endif
+#import "StreamConfiguration.h"
+#import "Controller.h"
 
 @class OnScreenControls;
 
 @interface ControllerSupport : NSObject
 
--(id) init;
+-(id) initWithConfig:(StreamConfiguration*)streamConfig;
+
+#if TARGET_OS_IPHONE
 -(void) initAutoOnScreenControlMode:(OnScreenControls*)osc;
 -(void) cleanup;
+-(Controller*) getOscController;
+#else
+-(void) assignGamepad:(struct Gamepad_device *)gamepad;
+-(void) removeGamepad:(struct Gamepad_device *)gamepad;
+-(NSMutableDictionary*) getControllers;
+#endif
 
 -(void) updateLeftStick:(Controller*)controller x:(short)x y:(short)y;
 -(void) updateRightStick:(Controller*)controller x:(short)x y:(short)y;
@@ -32,9 +41,10 @@
 -(void) clearButtonFlag:(Controller*)controller flags:(int)flags;
 
 -(void) updateFinished:(Controller*)controller;
--(Controller*) getOscController;
 
-+(int) getConnectedGamepadMask;
+-(void) rumble:(unsigned short)controllerNumber lowFreqMotor:(unsigned short)lowFreqMotor highFreqMotor:(unsigned short)highFreqMotor;
+
++(int) getConnectedGamepadMask:(StreamConfiguration*)streamConfig;
 
 @property (nonatomic, strong) id connectObserver;
 @property (nonatomic, strong) id disconnectObserver;

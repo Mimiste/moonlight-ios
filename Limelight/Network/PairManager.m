@@ -17,21 +17,21 @@
 
 @implementation PairManager {
     HttpManager* _httpManager;
-    NSData* _cert;
+    NSData* _clientCert;
     id<PairCallback> _callback;
 }
 
-- (id) initWithManager:(HttpManager*)httpManager andCert:(NSData*)cert callback:(id<PairCallback>)callback {
+- (id) initWithManager:(HttpManager*)httpManager clientCert:(NSData*)clientCert callback:(id<PairCallback>)callback {
     self = [super init];
     _httpManager = httpManager;
-    _cert = cert;
+    _clientCert = clientCert;
     _callback = callback;
     return self;
 }
 
 - (void) main {
     ServerInfoResponse* serverInfoResp = [[ServerInfoResponse alloc] init];
-    [_httpManager executeRequestSynchronously:[HttpRequest requestForResponse:serverInfoResp withUrlRequest:[_httpManager newServerInfoRequest]
+    [_httpManager executeRequestSynchronously:[HttpRequest requestForResponse:serverInfoResp withUrlRequest:[_httpManager newServerInfoRequest:false]
                                                fallbackError:401 fallbackRequest:[_httpManager newHttpServerInfoRequest]]];
     if (serverInfoResp == nil) {
         [_callback pairFailed:@"Unable to connect to PC"];
@@ -39,7 +39,7 @@
     }
     if ([serverInfoResp isStatusOk]) {
         if ([[serverInfoResp getStringTag:@"state"] hasSuffix:@"_SERVER_BUSY"]) {
-            [_callback pairFailed:@"You must stop streaming before attempting to pair."];
+            [_callback pairFailed:@"You cannot pair while a previous session is still running on the host PC. Quit any running games or reboot the host PC, then try pairing again."];
         } else if (![[serverInfoResp getStringTag:@"PairStatus"] isEqual:@"1"]) {
             NSString* appversion = [serverInfoResp getStringTag:@"appversion"];
             if (appversion == nil) {
@@ -53,8 +53,31 @@
     }
 }
 
+- (void) finishPairing:(UIBackgroundTaskIdentifier)bgId withError:(NSString*)errorMsg {
+    if (bgId != UIBackgroundTaskInvalid) {
+        [[UIApplication sharedApplication] endBackgroundTask:bgId];
+    }
+    
+    [_callback pairFailed:errorMsg];
+}
+
+- (void) finishPairing:(UIBackgroundTaskIdentifier)bgId withSuccess:(NSData*)derCertBytes {
+    if (bgId != UIBackgroundTaskInvalid) {
+        [[UIApplication sharedApplication] endBackgroundTask:bgId];
+    }
+    
+    [_callback pairSuccessful:derCertBytes];
+}
+
+// All codepaths must call finishPairing exactly once before returning!
 - (void) initiatePair:(int)serverMajorVersion {
     Log(LOG_I, @"Pairing with generation %d server", serverMajorVersion);
+    
+    // Start a background task to help prevent the app from being killed
+    // while pairing is in progress.
+    UIBackgroundTaskIdentifier bgId = [[UIApplication sharedApplication] beginBackgroundTaskWithName:@"Pairing PC" expirationHandler:^{
+        Log(LOG_W, @"Background pairing time has expired!");
+    }];
     
     NSString* PIN = [self generatePIN];
     NSData* salt = [self saltPIN:PIN];
@@ -62,21 +85,26 @@
     [_callback showPIN:PIN];
     
     HttpResponse* pairResp = [[HttpResponse alloc] init];
-    [_httpManager executeRequestSynchronously:[HttpRequest requestForResponse:pairResp withUrlRequest:[_httpManager newPairRequest:salt]]];
+    [_httpManager executeRequestSynchronously:[HttpRequest requestForResponse:pairResp withUrlRequest:[_httpManager newPairRequest:salt clientCert:_clientCert]]];
     if (![self verifyResponseStatus:pairResp]) {
+        [self finishPairing:bgId withError:@"Pairing stage #1 failed"];
         return;
     }
     NSInteger pairedStatus;
     if (![pairResp getIntTag:@"paired" value:&pairedStatus] || !pairedStatus) {
-        [_callback pairFailed:@"Pairing was declined by the target."];
+        [self finishPairing:bgId withError:@"Pairing was declined by the target."];
         return;
     }
     
     NSString* plainCert = [pairResp getStringTag:@"plaincert"];
     if ([plainCert length] == 0) {
-        [_callback pairFailed:@"Another pairing attempt is already in progress."];
+        [self finishPairing:bgId withError:@"Another pairing attempt is already in progress."];
         return;
     }
+    
+    // Pin the cert for TLS usage on this host
+    NSData* derCertBytes = [CryptoManager pemToDer:[Utils hexToBytes:plainCert]];
+    [_httpManager setServerCert:derCertBytes];
     
     CryptoManager* cryptoMan = [[CryptoManager alloc] init];
     NSData* aesKey;
@@ -97,12 +125,11 @@
     
     HttpResponse* challengeResp = [[HttpResponse alloc] init];
     [_httpManager executeRequestSynchronously:[HttpRequest requestForResponse:challengeResp withUrlRequest:[_httpManager newChallengeRequest:encryptedChallenge]]];
-    if (![self verifyResponseStatus:challengeResp]) {
-        return;
-    }
-    if (![challengeResp getIntTag:@"paired" value:&pairedStatus] || pairedStatus != 1) {
+    if (![self verifyResponseStatus:challengeResp] ||
+        ![challengeResp getIntTag:@"paired" value:&pairedStatus] ||
+        pairedStatus != 1) {
         [_httpManager executeRequestSynchronously:[HttpRequest requestWithUrlRequest:[_httpManager newUnpairRequest]]];
-        [_callback pairFailed:@"Pairing stage #2 failed"];
+        [self finishPairing:bgId withError:@"Pairing stage #2 failed"];
         return;
     }
     
@@ -113,7 +140,7 @@
     NSData* serverChallenge = [decServerChallengeResp subdataWithRange:NSMakeRange(hashLength, 16)];
     
     NSData* clientSecret = [Utils randomBytes:16];
-    NSData* challengeRespHashInput = [self concatData:[self concatData:serverChallenge with:[CryptoManager getSignatureFromCert:_cert]] with:clientSecret];
+    NSData* challengeRespHashInput = [self concatData:[self concatData:serverChallenge with:[CryptoManager getSignatureFromCert:_clientCert]] with:clientSecret];
     NSData* challengeRespHash;
     if (serverMajorVersion >= 7) {
         challengeRespHash = [cryptoMan SHA256HashData: challengeRespHashInput];
@@ -125,12 +152,11 @@
     
     HttpResponse* secretResp = [[HttpResponse alloc] init];
     [_httpManager executeRequestSynchronously:[HttpRequest requestForResponse:secretResp withUrlRequest:[_httpManager newChallengeRespRequest:challengeRespEncrypted]]];
-    if (![self verifyResponseStatus:secretResp]) {
-        return;
-    }
-    if (![secretResp getIntTag:@"paired" value:&pairedStatus] || pairedStatus != 1) {
+    if (![self verifyResponseStatus:secretResp] ||
+        ![secretResp getIntTag:@"paired" value:&pairedStatus] ||
+        pairedStatus != 1) {
         [_httpManager executeRequestSynchronously:[HttpRequest requestWithUrlRequest:[_httpManager newUnpairRequest]]];
-        [_callback pairFailed:@"Pairing stage #3 failed"];
+        [self finishPairing:bgId withError:@"Pairing stage #3 failed"];
         return;
     }
     
@@ -140,7 +166,7 @@
     
     if (![cryptoMan verifySignature:serverSecret withSignature:serverSignature andCert:[Utils hexToBytes:plainCert]]) {
         [_httpManager executeRequestSynchronously:[HttpRequest requestWithUrlRequest:[_httpManager newUnpairRequest]]];
-        [_callback pairFailed:@"Server certificate invalid"];
+        [self finishPairing:bgId withError:@"Server certificate invalid"];
         return;
     }
     
@@ -154,43 +180,41 @@
     }
     if (![serverChallengeRespHash isEqual:serverResponse]) {
         [_httpManager executeRequestSynchronously:[HttpRequest requestWithUrlRequest:[_httpManager newUnpairRequest]]];
-        [_callback pairFailed:@"Incorrect PIN"];
+        [self finishPairing:bgId withError:@"Incorrect PIN"];
         return;
     }
     
     NSData* clientPairingSecret = [self concatData:clientSecret with:[cryptoMan signData:clientSecret withKey:[CryptoManager readKeyFromFile]]];
     HttpResponse* clientSecretResp = [[HttpResponse alloc] init];
     [_httpManager executeRequestSynchronously:[HttpRequest requestForResponse:clientSecretResp withUrlRequest:[_httpManager newClientSecretRespRequest:[Utils bytesToHex:clientPairingSecret]]]];
-    if (![self verifyResponseStatus:clientSecretResp]) {
-        return;
-    }
-    if (![clientSecretResp getIntTag:@"paired" value:&pairedStatus] || pairedStatus != 1) {
+    if (![self verifyResponseStatus:clientSecretResp] ||
+        ![clientSecretResp getIntTag:@"paired" value:&pairedStatus] ||
+        pairedStatus != 1) {
         [_httpManager executeRequestSynchronously:[HttpRequest requestWithUrlRequest:[_httpManager newUnpairRequest]]];
-        [_callback pairFailed:@"Pairing stage #4 failed"];
+        [self finishPairing:bgId withError:@"Pairing stage #4 failed"];
         return;
     }
     
     HttpResponse* clientPairChallengeResp = [[HttpResponse alloc] init];
     [_httpManager executeRequestSynchronously:[HttpRequest requestForResponse:clientPairChallengeResp withUrlRequest:[_httpManager newPairChallenge]]];
-    if (![self verifyResponseStatus:clientPairChallengeResp]) {
-        return;
-    }
-    if (![clientPairChallengeResp getIntTag:@"paired" value:&pairedStatus] || pairedStatus != 1) {
+    if (![self verifyResponseStatus:clientPairChallengeResp] ||
+        ![clientPairChallengeResp getIntTag:@"paired" value:&pairedStatus] ||
+        pairedStatus != 1) {
         [_httpManager executeRequestSynchronously:[HttpRequest requestWithUrlRequest:[_httpManager newUnpairRequest]]];
-        [_callback pairFailed:@"Pairing stage #5 failed"];
+        [self finishPairing:bgId withError:@"Pairing stage #5 failed"];
         return;
     }
-    [_callback pairSuccessful];
+    
+    [self finishPairing:bgId withSuccess:derCertBytes];
 }
 
+// Caller calls finishPairing for us on failure
 - (BOOL) verifyResponseStatus:(HttpResponse*)resp {
     if (resp == nil) {
         [_httpManager executeRequestSynchronously:[HttpRequest requestWithUrlRequest:[_httpManager newUnpairRequest]]];
-        [_callback pairFailed:@"Network error occured."];
         return false;
     } else if (![resp isStatusOk]) {
         [_httpManager executeRequestSynchronously:[HttpRequest requestWithUrlRequest:[_httpManager newUnpairRequest]]];
-        [_callback pairFailed:resp.statusMessage];
         return false;
     } else {
         return true;

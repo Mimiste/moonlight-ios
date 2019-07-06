@@ -7,11 +7,12 @@
 //
 
 #import "VideoDecoderRenderer.h"
+#import "StreamView.h"
 
 #include "Limelight.h"
 
 @implementation VideoDecoderRenderer {
-    UIView *_view;
+    StreamView* _view;
     
     AVSampleBufferDisplayLayer* displayLayer;
     Boolean waitingForSps, waitingForPps, waitingForVps;
@@ -27,9 +28,14 @@
     
     displayLayer = [[AVSampleBufferDisplayLayer alloc] init];
     displayLayer.bounds = _view.bounds;
-    displayLayer.backgroundColor = [UIColor blackColor].CGColor;
+    displayLayer.backgroundColor = [OSColor blackColor].CGColor;
+    
     displayLayer.position = CGPointMake(CGRectGetMidX(_view.bounds), CGRectGetMidY(_view.bounds));
     displayLayer.videoGravity = AVLayerVideoGravityResizeAspect;
+    
+    // Hide the layer until we get an IDR frame. This ensures we
+    // can see the loading progress label as the stream is starting.
+    displayLayer.hidden = YES;
     
     if (oldLayer != nil) {
         // Switch out the old display layer with the new one
@@ -53,7 +59,7 @@
     }
 }
 
-- (id)initWithView:(UIView*)view
+- (id)initWithView:(StreamView*)view
 {
     self = [super init];
     
@@ -67,6 +73,9 @@
 - (void)setupWithVideoFormat:(int)videoFormat
 {
     self->videoFormat = videoFormat;
+#if !TARGET_OS_IPHONE
+    _view.codec = videoFormat;
+#endif
 }
 
 #define FRAME_START_PREFIX_SIZE 4
@@ -222,7 +231,12 @@
                 const size_t parameterSetSizes[] = { [vpsData length], [spsData length], [ppsData length] };
                 
                 Log(LOG_I, @"Constructing new HEVC format description");
+
+#if TARGET_OS_IPHONE
                 if (@available(iOS 11.0, *)) {
+#else
+                if (@available(macOS 10.13, *)) {
+#endif
                     status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault,
                                                                                  3, /* count of parameter sets */
                                                                                  parameterSetPointers,
@@ -259,8 +273,13 @@
     if (displayLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
         Log(LOG_E, @"Display layer rendering failed: %@", displayLayer.error);
         
-        // Recreate the display layer
-        [self reinitializeDisplayLayer];
+        // Recreate the display layer on the main thread.
+        // We need to use dispatch_sync() or we may miss
+        // some parameter sets while the layer is being
+        // recreated.
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [self reinitializeDisplayLayer];
+        });
         
         // Request an IDR frame to initialize the new decoder
         free(data);
@@ -327,12 +346,23 @@
         CFDictionarySetValue(dict, kCMSampleAttachmentKey_NotSync, kCFBooleanFalse);
         CFDictionarySetValue(dict, kCMSampleAttachmentKey_DependsOnOthers, kCFBooleanFalse);
     }
-    
-    [displayLayer enqueueSampleBuffer:sampleBuffer];
-    
-    // Dereference the buffers
-    CFRelease(blockBuffer);
-    CFRelease(sampleBuffer);
+
+#if !TARGET_OS_IPHONE
+    _view.frameCount++;
+#endif
+
+    // Enqueue video samples on the main thread
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // Enqueue the next frame
+        [self->displayLayer enqueueSampleBuffer:sampleBuffer];
+        
+        // Ensure the layer is visible now
+        self->displayLayer.hidden = NO;
+        
+        // Dereference the buffers
+        CFRelease(blockBuffer);
+        CFRelease(sampleBuffer);
+    });
     
     return DR_OK;
 }

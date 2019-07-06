@@ -18,7 +18,12 @@
     CGSize _labelSize;
 }
 static const float REFRESH_CYCLE = 2.0f;
+
+#if TARGET_OS_TV
+static const int LABEL_DY = 40;
+#else
 static const int LABEL_DY = 20;
+#endif
 
 - (id) init {
     self = [super init];
@@ -34,9 +39,7 @@ static const int LABEL_DY = 20;
     _hostLabel = [[UILabel alloc] init];
     _hostStatus = [[UILabel alloc] init];
     _hostPairState = [[UILabel alloc] init];
-    [_hostLabel setFont:[UIFont fontWithName:@"Roboto-Regular" size:[UIFont systemFontSize]]];
-    [_hostStatus setFont:[UIFont fontWithName:@"Roboto-Regular" size:[UIFont systemFontSize]]];
-	[_hostPairState setFont:[UIFont fontWithName:@"Roboto-Regular" size:[UIFont systemFontSize]]];
+
     return self;
 }
 
@@ -46,12 +49,19 @@ static const int LABEL_DY = 20;
     
     [_hostButton setBackgroundImage:[UIImage imageNamed:@"Computer"] forState:UIControlStateNormal];
     [_hostButton setContentEdgeInsets:UIEdgeInsetsMake(0, 4, 0, 4)];
-    [_hostButton addTarget:self action:@selector(addClicked) forControlEvents:UIControlEventTouchUpInside];
+    if (@available(iOS 9.0, tvOS 9.0, *)) {
+        [_hostButton addTarget:self action:@selector(addClicked) forControlEvents:UIControlEventPrimaryActionTriggered];
+    }
+    else {
+        [_hostButton addTarget:self action:@selector(addClicked) forControlEvents:UIControlEventTouchUpInside];
+    }
     [_hostButton sizeToFit];
     
     [_hostLabel setText:@"Add Host"];
     [_hostLabel sizeToFit];
+#if !TARGET_OS_TV
     _hostLabel.textColor = [UIColor whiteColor];
+#endif
     _hostLabel.center = CGPointMake(_hostButton.frame.origin.x + (_hostButton.frame.size.width / 2), _hostButton.frame.origin.y + _hostButton.frame.size.height + LABEL_DY);
     
     UIImageView* addIcon = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"AddComputerIcon"]];
@@ -77,9 +87,15 @@ static const int LABEL_DY = 20;
     _host = host;
     _callback = callback;
     
-    UILongPressGestureRecognizer* longPressRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(hostLongClicked)];
+    UILongPressGestureRecognizer* longPressRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(hostLongClicked:)];
     [_hostButton addGestureRecognizer:longPressRecognizer];
-    [_hostButton addTarget:self action:@selector(hostClicked) forControlEvents:UIControlEventTouchUpInside];
+    
+    if (@available(iOS 9.0, tvOS 9.0, *)) {
+        [_hostButton addTarget:self action:@selector(hostClicked) forControlEvents:UIControlEventPrimaryActionTriggered];
+    }
+    else {
+        [_hostButton addTarget:self action:@selector(hostClicked) forControlEvents:UIControlEventTouchUpInside];
+    }
     
     [self updateContentsForHost:host];
     [self updateBounds];
@@ -125,7 +141,9 @@ static const int LABEL_DY = 20;
 
 - (void) updateContentsForHost:(TemporaryHost*)host {
     _hostLabel.text = _host.name;
+#if !TARGET_OS_TV
     _hostLabel.textColor = [UIColor whiteColor];
+#endif
     [_hostLabel sizeToFit];
     
     switch (host.pairState) {
@@ -139,7 +157,9 @@ static const int LABEL_DY = 20;
             _hostPairState.text = @"Paired";
             break;
     }
+#if !TARGET_OS_TV
     _hostPairState.textColor = [UIColor whiteColor];
+#endif
     [_hostPairState sizeToFit];
     
     if (host.online) {
@@ -163,11 +183,17 @@ static const int LABEL_DY = 20;
 
 - (void) updateLoop {
     [self updateContentsForHost:_host];
-    [self performSelector:@selector(updateLoop) withObject:self afterDelay:REFRESH_CYCLE];
+    
+    // Stop updating when we detach from our parent view
+    if (self.superview != nil) {
+        [self performSelector:@selector(updateLoop) withObject:self afterDelay:REFRESH_CYCLE];
+    }
 }
 
-- (void) hostLongClicked {
-    [_callback hostLongClicked:_host view:self];
+- (void) hostLongClicked:(UILongPressGestureRecognizer*)gesture {
+    if (gesture.state == UIGestureRecognizerStateBegan) {
+        [_callback hostLongClicked:_host view:self];
+    }
 }
 
 - (void) hostClicked {
@@ -177,5 +203,15 @@ static const int LABEL_DY = 20;
 - (void) addClicked {
     [_callback addHostClicked];
 }
+
+#if TARGET_OS_TV
+- (void) didUpdateFocusInContext:(UIFocusUpdateContext *)context withAnimationCoordinator:(UIFocusAnimationCoordinator *)coordinator {
+    UIButton *previousButton = (UIButton *)context.previouslyFocusedItem;
+    UIButton *nextButton = (UIButton *) context.nextFocusedItem;
+    
+    previousButton.layer.shadowColor = [[UIColor blackColor] CGColor];
+    nextButton.layer.shadowColor = [[UIColor greenColor] CGColor];
+}
+#endif
 
 @end

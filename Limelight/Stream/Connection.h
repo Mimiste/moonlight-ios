@@ -6,7 +6,6 @@
 //  Copyright (c) 2014 Moonlight Stream. All rights reserved.
 //
 
-#import <Foundation/Foundation.h>
 #import "VideoDecoderRenderer.h"
 #import "StreamConfiguration.h"
 
@@ -18,8 +17,7 @@
 - (void) stageComplete:(const char*)stageName;
 - (void) stageFailed:(const char*)stageName withError:(long)errorCode;
 - (void) launchFailed:(NSString*)message;
-- (void) displayMessage:(const char*)message;
-- (void) displayTransientMessage:(const char*)message;
+- (void) rumble:(unsigned short)controllerNumber lowFreqMotor:(unsigned short)lowFreqMotor highFreqMotor:(unsigned short)highFreqMotor;
 
 @end
 

@@ -13,7 +13,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 
 #include "Limelight.h"
-#include "opus.h"
+#include "opus_multistream.h"
 
 @implementation Connection {
     SERVER_INFORMATION _serverInfo;
@@ -21,29 +21,31 @@
     CONNECTION_LISTENER_CALLBACKS _clCallbacks;
     DECODER_RENDERER_CALLBACKS _drCallbacks;
     AUDIO_RENDERER_CALLBACKS _arCallbacks;
+    char _hostString[256];
+    char _appVersionString[32];
+    char _gfeVersionString[32];
 }
 
 static NSLock* initLock;
-static OpusDecoder *opusDecoder;
+static OpusMSDecoder* opusDecoder;
 static id<ConnectionCallbacks> _callbacks;
 
-#define PCM_BUFFER_SIZE 1024
 #define OUTPUT_BUS 0
 
-struct AUDIO_BUFFER_QUEUE_ENTRY {
-    struct AUDIO_BUFFER_QUEUE_ENTRY *next;
-    int length;
-    int offset;
-    char data[0];
-};
+#define MAX_CHANNEL_COUNT 2
+#define FRAME_SIZE 240
 
-#define MAX_QUEUE_ENTRIES 10
+#define CIRCULAR_BUFFER_SIZE 32
 
-static short decodedPcmBuffer[512];
-static NSLock *audioLock;
-static struct AUDIO_BUFFER_QUEUE_ENTRY *audioBufferQueue;
-static int audioBufferQueueLength;
-static AudioComponentInstance audioUnit;
+static int audioBufferWriteIndex;
+static int audioBufferReadIndex;
+static int activeChannelCount;
+static short audioCircularBuffer[CIRCULAR_BUFFER_SIZE][FRAME_SIZE * MAX_CHANNEL_COUNT];
+
+#define AUDIO_QUEUE_BUFFERS 4
+
+static AudioQueueRef audioQueue;
+static AudioQueueBufferRef audioBuffers[AUDIO_QUEUE_BUFFERS];
 static VideoDecoderRenderer* renderer;
 
 int DrDecoderSetup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags)
@@ -61,7 +63,7 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit)
         // A frame was lost due to OOM condition
         return DR_NEED_IDR;
     }
-    
+
     PLENTRY entry = decodeUnit->bufferList;
     while (entry != NULL) {
         // Submit parameter set NALUs directly since no copy is required by the decoder
@@ -76,10 +78,10 @@ int DrSubmitDecodeUnit(PDECODE_UNIT decodeUnit)
             memcpy(&data[offset], entry->data, entry->length);
             offset += entry->length;
         }
-        
+
         entry = entry->next;
     }
-    
+
     // This function will take our picture data buffer
     return [renderer submitDecodeBuffer:data length:offset bufferType:BUFFER_TYPE_PICDATA];
 }
@@ -88,40 +90,35 @@ int ArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig, v
 {
     int err;
     
-    // We only support stereo for now
+    // Clear the circular buffer
+    audioBufferWriteIndex = audioBufferReadIndex = 0;
+
+    // We only support stereo for now.
+    // TODO: Ensure AudioToolbox's channel mapping matches Opus's
+    // and correct if neccessary.
     assert(audioConfiguration == AUDIO_CONFIGURATION_STEREO);
-    
-    opusDecoder = opus_decoder_create(opusConfig->sampleRate,
-                                      opusConfig->channelCount,
-                                      &err);
-    
-    audioLock = [[NSLock alloc] init];
-    
+
+    activeChannelCount = opusConfig->channelCount;
+    opusDecoder = opus_multistream_decoder_create(opusConfig->sampleRate,
+                                                  opusConfig->channelCount,
+                                                  opusConfig->streams,
+                                                  opusConfig->coupledStreams,
+                                                  opusConfig->mapping,
+                                                  &err);
+
+#if TARGET_OS_IPHONE
     // Configure the audio session for our app
     NSError *audioSessionError = nil;
     AVAudioSession* audioSession = [AVAudioSession sharedInstance];
-    
+
     [audioSession setPreferredSampleRate:opusConfig->sampleRate error:&audioSessionError];
     [audioSession setCategory: AVAudioSessionCategoryPlayback error: &audioSessionError];
     [audioSession setPreferredOutputNumberOfChannels:opusConfig->channelCount error:&audioSessionError];
     [audioSession setPreferredIOBufferDuration:0.005 error:&audioSessionError];
     [audioSession setActive: YES error: &audioSessionError];
+#endif
     
     OSStatus status;
-    
-    AudioComponentDescription audioDesc;
-    audioDesc.componentType = kAudioUnitType_Output;
-    audioDesc.componentSubType = kAudioUnitSubType_RemoteIO;
-    audioDesc.componentFlags = 0;
-    audioDesc.componentFlagsMask = 0;
-    audioDesc.componentManufacturer = kAudioUnitManufacturer_Apple;
-    
-    status = AudioComponentInstanceNew(AudioComponentFindNext(NULL, &audioDesc), &audioUnit);
-    
-    if (status) {
-        Log(LOG_E, @"Unable to instantiate new AudioComponent: %d", (int32_t)status);
-        return status;
-    }
     
     AudioStreamBasicDescription audioFormat = {0};
     audioFormat.mSampleRate = opusConfig->sampleRate;
@@ -133,42 +130,26 @@ int ArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig, v
     audioFormat.mBytesPerPacket = audioFormat.mBytesPerFrame;
     audioFormat.mFramesPerPacket = audioFormat.mBytesPerPacket / audioFormat.mBytesPerFrame;
     audioFormat.mReserved = 0;
-    
-    status = AudioUnitSetProperty(audioUnit,
-                                  kAudioUnitProperty_StreamFormat,
-                                  kAudioUnitScope_Input,
-                                  OUTPUT_BUS,
-                                  &audioFormat,
-                                  sizeof(audioFormat));
-    if (status) {
-        Log(LOG_E, @"Unable to set audio unit to input: %d", (int32_t)status);
+
+    status = AudioQueueNewOutput(&audioFormat, FillOutputBuffer, nil, nil, nil, 0, &audioQueue);
+    if (status != noErr) {
+        Log(LOG_E, @"Error allocating output queue: %d\n", status);
         return status;
     }
     
-    AURenderCallbackStruct callbackStruct = {0};
-    callbackStruct.inputProc = playbackCallback;
-    callbackStruct.inputProcRefCon = NULL;
-    
-    status = AudioUnitSetProperty(audioUnit,
-                                  kAudioUnitProperty_SetRenderCallback,
-                                  kAudioUnitScope_Input,
-                                  OUTPUT_BUS,
-                                  &callbackStruct,
-                                  sizeof(callbackStruct));
-    if (status) {
-        Log(LOG_E, @"Unable to set audio unit callback: %d", (int32_t)status);
-        return status;
+    for (int i = 0; i < AUDIO_QUEUE_BUFFERS; i++) {
+        status = AudioQueueAllocateBuffer(audioQueue, audioFormat.mBytesPerFrame * FRAME_SIZE, &audioBuffers[i]);
+        if (status != noErr) {
+            Log(LOG_E, @"Error allocating output buffer: %d\n", status);
+            return status;
+        }
+        
+        FillOutputBuffer(nil, audioQueue, audioBuffers[i]);
     }
     
-    status = AudioUnitInitialize(audioUnit);
-    if (status) {
-        Log(LOG_E, @"Unable to initialize audioUnit: %d", (int32_t)status);
-        return status;
-    }
-    
-    status = AudioOutputUnitStart(audioUnit);
-    if (status) {
-        Log(LOG_E, @"Unable to start audioUnit: %d", (int32_t)status);
+    status = AudioQueueStart(audioQueue, nil);
+    if (status != noErr) {
+        Log(LOG_E, @"Error starting queue: %d\n", status);
         return status;
     }
     
@@ -178,77 +159,44 @@ int ArInit(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig, v
 void ArCleanup(void)
 {
     if (opusDecoder != NULL) {
-        opus_decoder_destroy(opusDecoder);
+        opus_multistream_decoder_destroy(opusDecoder);
         opusDecoder = NULL;
     }
     
-    OSStatus status = AudioOutputUnitStop(audioUnit);
-    if (status) {
-        Log(LOG_E, @"Unable to stop audioUnit: %d", (int32_t)status);
-    }
+    // Stop before disposing to avoid massive delay inside
+    // AudioQueueDispose() (iOS bug?)
+    AudioQueueStop(audioQueue, true);
     
-    status = AudioUnitUninitialize(audioUnit);
-    if (status) {
-        Log(LOG_E, @"Unable to uninitialize audioUnit: %d", (int32_t)status);
-    }
+    // Also frees buffers
+    AudioQueueDispose(audioQueue, true);
     
+#if TARGET_OS_IPHONE
     // Audio session is now inactive
     AVAudioSession* audioSession = [AVAudioSession sharedInstance];
     [audioSession setActive: YES error: nil];
-    
-    // This is safe because we're guaranteed that nobody
-    // is touching this list now
-    struct AUDIO_BUFFER_QUEUE_ENTRY *entry;
-    while (audioBufferQueue != NULL) {
-        entry = audioBufferQueue;
-        audioBufferQueue = entry->next;
-        audioBufferQueueLength--;
-        free(entry);
-    }
+#endif
 }
 
 void ArDecodeAndPlaySample(char* sampleData, int sampleLength)
 {
-    int decodedLength = opus_decode(opusDecoder, (unsigned char*)sampleData, sampleLength, decodedPcmBuffer, PCM_BUFFER_SIZE / 2, 0);
-    if (decodedLength > 0) {
-        // Return of opus_decode is samples per channel
-        decodedLength *= 4;
+    int decodeLen;
+    
+    // Check if there is space for this sample in the buffer. Again, this can race
+    // but in the worst case, we'll not see the sample callback having consumed a sample.
+    if (((audioBufferWriteIndex + 1) % CIRCULAR_BUFFER_SIZE) == audioBufferReadIndex) {
+        return;
+    }
+    
+    decodeLen = opus_multistream_decode(opusDecoder, (unsigned char *)sampleData, sampleLength,
+                                        audioCircularBuffer[audioBufferWriteIndex], FRAME_SIZE, 0);
+    if (decodeLen > 0) {
+        // Use a full memory barrier to ensure the circular buffer is written before incrementing the index
+        __sync_synchronize();
         
-        struct AUDIO_BUFFER_QUEUE_ENTRY *newEntry = malloc(sizeof(*newEntry) + decodedLength);
-        if (newEntry != NULL) {
-            newEntry->next = NULL;
-            newEntry->length = decodedLength;
-            newEntry->offset = 0;
-            memcpy(newEntry->data, decodedPcmBuffer, decodedLength);
-            
-            [audioLock lock];
-            if (audioBufferQueueLength > MAX_QUEUE_ENTRIES) {
-                Log(LOG_W, @"Audio player too slow. Dropping all decoded samples!");
-                
-                // Clear all values from the buffer queue
-                struct AUDIO_BUFFER_QUEUE_ENTRY *entry;
-                while (audioBufferQueue != NULL) {
-                    entry = audioBufferQueue;
-                    audioBufferQueue = entry->next;
-                    audioBufferQueueLength--;
-                    free(entry);
-                }
-            }
-            
-            if (audioBufferQueue == NULL) {
-                audioBufferQueue = newEntry;
-            }
-            else {
-                struct AUDIO_BUFFER_QUEUE_ENTRY *lastEntry = audioBufferQueue;
-                while (lastEntry->next != NULL) {
-                    lastEntry = lastEntry->next;
-                }
-                lastEntry->next = newEntry;
-            }
-            audioBufferQueueLength++;
-            
-            [audioLock unlock];
-        }
+        // This can race with the reader in the sample callback, however this is a benign
+        // race since we'll either read the original value of s_WriteIndex (which is safe,
+        // we just won't consider this sample) or the new value of s_WriteIndex
+        audioBufferWriteIndex = (audioBufferWriteIndex + 1) % CIRCULAR_BUFFER_SIZE;
     }
 }
 
@@ -277,16 +225,6 @@ void ClConnectionTerminated(long errorCode)
     [_callbacks connectionTerminated: errorCode];
 }
 
-void ClDisplayMessage(const char* message)
-{
-    [_callbacks displayMessage: message];
-}
-
-void ClDisplayTransientMessage(const char* message)
-{
-    [_callbacks displayTransientMessage: message];
-}
-
 void ClLogMessage(const char* format, ...)
 {
     va_list va;
@@ -295,8 +233,19 @@ void ClLogMessage(const char* format, ...)
     va_end(va);
 }
 
+void ClRumble(unsigned short controllerNumber, unsigned short lowFreqMotor, unsigned short highFreqMotor)
+{
+    [_callbacks rumble:controllerNumber lowFreqMotor:lowFreqMotor highFreqMotor:highFreqMotor];
+}
+
 -(void) terminate
 {
+    // Interrupt any action blocking LiStartConnection(). This is
+    // thread-safe and done outside initLock on purpose, since we
+    // won't be able to acquire it if LiStartConnection is in
+    // progress.
+    LiInterruptConnection();
+    
     // We dispatch this async to get out because this can be invoked
     // on a thread inside common and we don't want to deadlock. It also avoids
     // blocking on the caller's thread waiting to acquire initLock.
@@ -310,153 +259,148 @@ void ClLogMessage(const char* format, ...)
 -(id) initWithConfig:(StreamConfiguration*)config renderer:(VideoDecoderRenderer*)myRenderer connectionCallbacks:(id<ConnectionCallbacks>)callbacks
 {
     self = [super init];
-    
+
     // Use a lock to ensure that only one thread is initializing
     // or deinitializing a connection at a time.
     if (initLock == nil) {
         initLock = [[NSLock alloc] init];
     }
     
-    LiInitializeServerInformation(&_serverInfo);
-    _serverInfo.address = [config.host cStringUsingEncoding:NSUTF8StringEncoding];
-    _serverInfo.serverInfoAppVersion = [config.appVersion cStringUsingEncoding:NSUTF8StringEncoding];
+    strncpy(_hostString,
+            [config.host cStringUsingEncoding:NSUTF8StringEncoding],
+            sizeof(_hostString));
+    strncpy(_appVersionString,
+            [config.appVersion cStringUsingEncoding:NSUTF8StringEncoding],
+            sizeof(_appVersionString));
     if (config.gfeVersion != nil) {
-        _serverInfo.serverInfoGfeVersion = [config.gfeVersion cStringUsingEncoding:NSUTF8StringEncoding];
+        strncpy(_gfeVersionString,
+                [config.gfeVersion cStringUsingEncoding:NSUTF8StringEncoding],
+                sizeof(_gfeVersionString));
     }
-    
+
+    LiInitializeServerInformation(&_serverInfo);
+    _serverInfo.address = _hostString;
+    _serverInfo.serverInfoAppVersion = _appVersionString;
+    if (config.gfeVersion != nil) {
+        _serverInfo.serverInfoGfeVersion = _gfeVersionString;
+    }
+
     renderer = myRenderer;
     _callbacks = callbacks;
-    
+
     LiInitializeStreamConfiguration(&_streamConfig);
     _streamConfig.width = config.width;
     _streamConfig.height = config.height;
     _streamConfig.fps = config.frameRate;
     _streamConfig.bitrate = config.bitRate;
-    
-    // On iOS 11, we can use HEVC if the server supports encoding it
-    // and this device has hardware decode for it (A9 and later)
-    if (@available(iOS 11.0, *)) {
-        _streamConfig.supportsHevc = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC);
-    }
+    _streamConfig.enableHdr = config.enableHdr;
     
     // Use some of the HEVC encoding efficiency improvements to
     // reduce bandwidth usage while still gaining some image
     // quality improvement.
     _streamConfig.hevcBitratePercentageMultiplier = 75;
     
-    // FIXME: We should use 1024 when streaming remotely
-    _streamConfig.packetSize = 1292;
+    // Detect remote streaming automatically based on the IP address of the target
+    _streamConfig.streamingRemotely = STREAM_CFG_AUTO;
+    _streamConfig.packetSize = 1392;
     
+    switch (config.audioChannelCount) {
+        case 2:
+            _streamConfig.audioConfiguration = AUDIO_CONFIGURATION_STEREO;
+            break;
+        case 6:
+            _streamConfig.audioConfiguration = AUDIO_CONFIGURATION_51_SURROUND;
+            break;
+        default:
+            Log(LOG_E, @"Unknown audio channel count: %d", config.audioChannelCount);
+            abort();
+    }
+    
+    // HDR implies HEVC allowed
+    if (config.enableHdr) {
+        config.allowHevc = YES;
+    }
+
+#if TARGET_OS_IPHONE
+    // On iOS 11, we can use HEVC if the server supports encoding it
+    // and this device has hardware decode for it (A9 and later).
+    // Additionally, iPhone X had a bug which would cause video
+    // to freeze after a few minutes with HEVC prior to iOS 11.3.
+    // As a result, we will only use HEVC on iOS 11.3 or later.
+    if (@available(iOS 11.3, tvOS 11.3, *)) {
+        _streamConfig.supportsHevc = config.allowHevc && VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC);
+    }
+#else
+    if (@available(macOS 10.13, *)) {
+        // Streaming with limited bandwidth will result in better quality with HEVC
+        if (VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) || _streamConfig.streamingRemotely != 0)
+            _streamConfig.supportsHevc = config.allowHevc;
+    }
+#endif
+    
+    // HEVC must be supported when HDR is enabled
+    assert(!_streamConfig.enableHdr || _streamConfig.supportsHevc);
+
     memcpy(_streamConfig.remoteInputAesKey, [config.riKey bytes], [config.riKey length]);
     memset(_streamConfig.remoteInputAesIv, 0, 16);
     int riKeyId = htonl(config.riKeyId);
     memcpy(_streamConfig.remoteInputAesIv, &riKeyId, sizeof(riKeyId));
-    
+
     LiInitializeVideoCallbacks(&_drCallbacks);
     _drCallbacks.setup = DrDecoderSetup;
     _drCallbacks.submitDecodeUnit = DrSubmitDecodeUnit;
-    
+
     // RFI doesn't work properly with HEVC on iOS 11 with an iPhone SE (at least)
-    _drCallbacks.capabilities = CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC;
-    
+    // It doesnt work on macOS either, tested with Network Link Conditioner.
+    _drCallbacks.capabilities = CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC |
+                                CAPABILITY_DIRECT_SUBMIT;
+
     LiInitializeAudioCallbacks(&_arCallbacks);
     _arCallbacks.init = ArInit;
     _arCallbacks.cleanup = ArCleanup;
     _arCallbacks.decodeAndPlaySample = ArDecodeAndPlaySample;
-    
+    _arCallbacks.capabilities = CAPABILITY_DIRECT_SUBMIT;
+
     LiInitializeConnectionCallbacks(&_clCallbacks);
     _clCallbacks.stageStarting = ClStageStarting;
     _clCallbacks.stageComplete = ClStageComplete;
     _clCallbacks.stageFailed = ClStageFailed;
     _clCallbacks.connectionStarted = ClConnectionStarted;
     _clCallbacks.connectionTerminated = ClConnectionTerminated;
-    _clCallbacks.displayMessage = ClDisplayMessage;
-    _clCallbacks.displayTransientMessage = ClDisplayTransientMessage;
     _clCallbacks.logMessage = ClLogMessage;
-    
+    _clCallbacks.rumble = ClRumble;
+
     return self;
 }
 
-static OSStatus playbackCallback(void *inRefCon,
-                                 AudioUnitRenderActionFlags *ioActionFlags,
-                                 const AudioTimeStamp *inTimeStamp,
-                                 UInt32 inBusNumber,
-                                 UInt32 inNumberFrames,
-                                 AudioBufferList *ioData) {
-    // Notes: ioData contains buffers (may be more than one!)
-    // Fill them up as much as you can. Remember to set the size value in each buffer to match how
-    // much data is in the buffer.
+static void FillOutputBuffer(void *aqData,
+                             AudioQueueRef inAQ,
+                             AudioQueueBufferRef inBuffer) {
+    inBuffer->mAudioDataByteSize = activeChannelCount * FRAME_SIZE * sizeof(short);
     
-    bool ranOutOfData = false;
-    for (int i = 0; i < ioData->mNumberBuffers; i++) {
-        ioData->mBuffers[i].mNumberChannels = 2;
+    assert(inBuffer->mAudioDataByteSize == inBuffer->mAudioDataBytesCapacity);
+    
+    // If the indexes aren't equal, we have a sample
+    if (audioBufferWriteIndex != audioBufferReadIndex) {
+        // Copy data to the audio buffer
+        memcpy(inBuffer->mAudioData,
+               audioCircularBuffer[audioBufferReadIndex],
+               inBuffer->mAudioDataByteSize);
         
-        if (ranOutOfData) {
-            ioData->mBuffers[i].mDataByteSize = 0;
-            continue;
-        }
+        // Use a full memory barrier to ensure the circular buffer is read before incrementing the index
+        __sync_synchronize();
         
-        if (ioData->mBuffers[i].mDataByteSize != 0) {
-            int thisBufferOffset = 0;
-            
-        FillBufferAgain:
-            // Make sure there's data to write
-            if (ioData->mBuffers[i].mDataByteSize - thisBufferOffset == 0) {
-                continue;
-            }
-            
-            struct AUDIO_BUFFER_QUEUE_ENTRY *audioEntry = NULL;
-            
-            [audioLock lock];
-            if (audioBufferQueue != NULL) {
-                // Dequeue this entry temporarily
-                audioEntry = audioBufferQueue;
-                audioBufferQueue = audioBufferQueue->next;
-                audioBufferQueueLength--;
-            }
-            [audioLock unlock];
-            
-            if (audioEntry == NULL) {
-                // No data left
-                ranOutOfData = true;
-                ioData->mBuffers[i].mDataByteSize = thisBufferOffset;
-                continue;
-            }
-            
-            // Figure out how much data we can write
-            int min = MIN(ioData->mBuffers[i].mDataByteSize - thisBufferOffset, audioEntry->length);
-            
-            // Copy data to the audio buffer
-            memcpy(&ioData->mBuffers[i].mData[thisBufferOffset], &audioEntry->data[audioEntry->offset], min);
-            thisBufferOffset += min;
-            
-            if (min < audioEntry->length) {
-                // This entry still has unused data
-                audioEntry->length -= min;
-                audioEntry->offset += min;
-                
-                // Requeue the entry
-                [audioLock lock];
-                audioEntry->next = audioBufferQueue;
-                audioBufferQueue = audioEntry;
-                audioBufferQueueLength++;
-                [audioLock unlock];
-            }
-            else {
-                // This entry is fully depleted so free it
-                free(audioEntry);
-                
-                // Try to grab another sample to fill this buffer with
-                goto FillBufferAgain;
-            }
-
-            ioData->mBuffers[i].mDataByteSize = thisBufferOffset;
-        }
+        // This can race with the reader in the AudDecDecodeAndPlaySample function. This is
+        // not a problem because at worst, it just won't see that we've consumed this sample yet.
+        audioBufferReadIndex = (audioBufferReadIndex + 1) % CIRCULAR_BUFFER_SIZE;
+    }
+    else {
+        // No data, so play silence
+        memset(inBuffer->mAudioData, 0, inBuffer->mAudioDataByteSize);
     }
     
-    return noErr;
+    AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
 }
-
 
 -(void) main
 {

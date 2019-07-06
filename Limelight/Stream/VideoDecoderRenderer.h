@@ -6,13 +6,11 @@
 //  Copyright (c) 2014 Moonlight Stream. All rights reserved.
 //
 
-#import <Foundation/Foundation.h>
-
 @import AVFoundation;
 
 @interface VideoDecoderRenderer : NSObject
 
-- (id)initWithView:(UIView*)view;
+- (id)initWithView:(OSView*)view;
 
 - (void)setupWithVideoFormat:(int)videoFormat;
 

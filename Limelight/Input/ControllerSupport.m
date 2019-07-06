@@ -7,36 +7,76 @@
 //
 
 #import "ControllerSupport.h"
+#import "Controller.h"
+
 #import "OnScreenControls.h"
+#if !TARGET_OS_IPHONE
+#import "Gamepad.h"
+#import "Control.h"
+#endif
+
 #import "DataManager.h"
 #include "Limelight.h"
 
-// Swift
-#import "Moonlight-Swift.h"
-@class Controller;
-
 @import GameController;
+@import AudioToolbox;
 
 @implementation ControllerSupport {
     NSLock *_controllerStreamLock;
     NSMutableDictionary *_controllers;
+    NSTimer *_rumbleTimer;
     
     OnScreenControls *_osc;
-    bool _oscEnabled;
     
     // This controller object is shared between on-screen controls
     // and player 0
     Controller *_player0osc;
     
-    char _controllerNumbers;
-    
 #define EMULATING_SELECT     0x1
 #define EMULATING_SPECIAL    0x2
+    
+    bool _oscEnabled;
+    char _controllerNumbers;
+    bool _multiController;
 }
 
 // UPDATE_BUTTON_FLAG(controller, flag, pressed)
 #define UPDATE_BUTTON_FLAG(controller, x, y) \
 ((y) ? [self setButtonFlag:controller flags:x] : [self clearButtonFlag:controller flags:x])
+
+-(void) rumbleController: (Controller*)controller
+{
+#if 0
+    // Only vibrate if the amplitude is large enough
+    if (controller.lowFreqMotor > 0x5000 || controller.highFreqMotor > 0x5000) {
+        // If the gamepad is nil (on-screen controls) or it's attached to the device,
+        // then vibrate the device itself
+        if (controller.gamepad == nil || [controller.gamepad isAttachedToDevice]) {
+            AudioServicesPlayAlertSound(kSystemSoundID_Vibrate);
+        }
+    }
+#endif
+}
+
+-(void) rumble:(unsigned short)controllerNumber lowFreqMotor:(unsigned short)lowFreqMotor highFreqMotor:(unsigned short)highFreqMotor
+{
+    Controller* controller = [_controllers objectForKey:[NSNumber numberWithInteger:controllerNumber]];
+    if (controller == nil && controllerNumber == 0 && _oscEnabled) {
+        // No physical controller, but we have on-screen controls
+        controller = _player0osc;
+    }
+    if (controller == nil) {
+        // No connected controller for this player
+        return;
+    }
+    
+    // Update the motor levels for the rumble timer to grab next iteration
+    controller.lowFreqMotor = lowFreqMotor;
+    controller.highFreqMotor = highFreqMotor;
+    
+    // Rumble now to ensure short vibrations aren't missed
+    [self rumbleController:controller];
+}
 
 -(void) updateLeftStick:(Controller*)controller x:(short)x y:(short)y
 {
@@ -114,17 +154,16 @@
 -(void) updateButtonFlags:(Controller*)controller flags:(int)flags
 {
     @synchronized(controller) {
-        int releasedButtons = (controller.lastButtonFlags ^ flags) & ~flags;
-        int pressedButtons = (controller.lastButtonFlags ^ flags) & flags;
-        
         controller.lastButtonFlags = flags;
         
         // This must be called before handleSpecialCombosPressed
         // because we clear the original button flags there
+        int releasedButtons = (controller.lastButtonFlags ^ flags) & ~flags;
+        int pressedButtons = (controller.lastButtonFlags ^ flags) & flags;
+        
         [self handleSpecialCombosReleased:controller releasedButtons:releasedButtons];
         
         [self handleSpecialCombosPressed:controller pressedButtons:pressedButtons];
-        
     }
 }
 
@@ -149,7 +188,8 @@
     [_controllerStreamLock lock];
     @synchronized(controller) {
         // Player 1 is always present for OSC
-        LiSendMultiControllerEvent(controller.playerIndex, _controllerNumbers | (_oscEnabled ? 1 : 0), controller.lastButtonFlags, controller.lastLeftTrigger, controller.lastRightTrigger, controller.lastLeftStickX, controller.lastLeftStickY, controller.lastRightStickX, controller.lastRightStickY);
+        LiSendMultiControllerEvent(_multiController ? controller.playerIndex : 0,
+                                   (_multiController ? _controllerNumbers : 1) | (_oscEnabled ? 1 : 0), controller.lastButtonFlags, controller.lastLeftTrigger, controller.lastRightTrigger, controller.lastLeftStickX, controller.lastLeftStickY, controller.lastRightStickX, controller.lastRightStickY);
     }
     [_controllerStreamLock unlock];
 }
@@ -171,21 +211,29 @@
 -(void) registerControllerCallbacks:(GCController*) controller
 {
     if (controller != NULL) {
-        controller.controllerPausedHandler = ^(GCController *controller) {
-            Controller* limeController = [_controllers objectForKey:[NSNumber numberWithInteger:controller.playerIndex]];
-            [self setButtonFlag:limeController flags:PLAY_FLAG];
-            [self updateFinished:limeController];
-            
-            // Pause for 100 ms
-            usleep(100 * 1000);
-            
-            [self clearButtonFlag:limeController flags:PLAY_FLAG];
-            [self updateFinished:limeController];
-        };
+        // On iOS 13, we want to use the new buttonMenu property which lets users hold down Start.
+        // On prior versions, we must use the controllerPausedHandler.
+        if (![controller.extendedGamepad respondsToSelector:@selector(buttonMenu)]) {
+            controller.controllerPausedHandler = ^(GCController *controller) {
+                Controller* limeController = [self->_controllers objectForKey:[NSNumber numberWithInteger:controller.playerIndex]];
+                
+                // Get off the main thread
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                    [self setButtonFlag:limeController flags:PLAY_FLAG];
+                    [self updateFinished:limeController];
+                    
+                    // Pause for 100 ms
+                    usleep(100 * 1000);
+                    
+                    [self clearButtonFlag:limeController flags:PLAY_FLAG];
+                    [self updateFinished:limeController];
+                });
+            };
+        }
         
         if (controller.extendedGamepad != NULL) {
             controller.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *gamepad, GCControllerElement *element) {
-                Controller* limeController = [_controllers objectForKey:[NSNumber numberWithInteger:gamepad.controller.playerIndex]];
+                Controller* limeController = [self->_controllers objectForKey:[NSNumber numberWithInteger:gamepad.controller.playerIndex]];
                 short leftStickX, leftStickY;
                 short rightStickX, rightStickY;
                 char leftTrigger, rightTrigger;
@@ -202,6 +250,35 @@
                 
                 UPDATE_BUTTON_FLAG(limeController, LB_FLAG, gamepad.leftShoulder.pressed);
                 UPDATE_BUTTON_FLAG(limeController, RB_FLAG, gamepad.rightShoulder.pressed);
+                
+                // Yay, iOS 12.1 now supports analog stick buttons
+                if (@available(iOS 12.1, tvOS 12.1, *)) {
+                    if (gamepad.leftThumbstickButton != nil) {
+                        UPDATE_BUTTON_FLAG(limeController, LS_CLK_FLAG, gamepad.leftThumbstickButton.pressed);
+                    }
+                    if (gamepad.rightThumbstickButton != nil) {
+                        UPDATE_BUTTON_FLAG(limeController, RS_CLK_FLAG, gamepad.rightThumbstickButton.pressed);
+                    }
+                }
+                
+                // Until the iOS 13 SDK is released, we must use performSelector: and respondsToSelector:
+                // to exercise the new buttonMenu and buttonOptions properties.
+                if (@available(iOS 13.0, tvOS 13.0, *)) {
+                    if ([gamepad respondsToSelector:@selector(buttonMenu)]) {
+                        GCControllerButtonInput* menuButton = [gamepad performSelector:@selector(buttonMenu)];
+                        
+                        // Menu button is mandatory, so no need to check for nil
+                        UPDATE_BUTTON_FLAG(limeController, PLAY_FLAG, menuButton.pressed);
+                    }
+                    if ([gamepad respondsToSelector:@selector(buttonOptions)]) {
+                        GCControllerButtonInput* optionsButton = [gamepad performSelector:@selector(buttonOptions)];
+                        
+                        // Options button is optional (only present on Xbox One S and PS4 gamepads)
+                        if (optionsButton != nil) {
+                            UPDATE_BUTTON_FLAG(limeController, BACK_FLAG, optionsButton.pressed);
+                        }
+                    }
+                }
                 
                 leftStickX = gamepad.leftThumbstick.xAxis.value * 0x7FFE;
                 leftStickY = gamepad.leftThumbstick.yAxis.value * 0x7FFE;
@@ -220,7 +297,7 @@
         }
         else if (controller.gamepad != NULL) {
             controller.gamepad.valueChangedHandler = ^(GCGamepad *gamepad, GCControllerElement *element) {
-                Controller* limeController = [_controllers objectForKey:[NSNumber numberWithInteger:gamepad.controller.playerIndex]];
+                Controller* limeController = [self->_controllers objectForKey:[NSNumber numberWithInteger:gamepad.controller.playerIndex]];
                 UPDATE_BUTTON_FLAG(limeController, A_FLAG, gamepad.buttonA.pressed);
                 UPDATE_BUTTON_FLAG(limeController, B_FLAG, gamepad.buttonB.pressed);
                 UPDATE_BUTTON_FLAG(limeController, X_FLAG, gamepad.buttonX.pressed);
@@ -259,6 +336,28 @@
         if (controller != NULL) {
             if (controller.extendedGamepad != NULL) {
                 level = OnScreenControlsLevelAutoGCExtendedGamepad;
+                if (@available(iOS 12.1, tvOS 12.1, *)) {
+                    if (controller.extendedGamepad.leftThumbstickButton != nil &&
+                        controller.extendedGamepad.rightThumbstickButton != nil) {
+                        GCControllerButtonInput* optionsButton = nil;
+                        
+                        if (@available(iOS 13.0, tvOS 13.0, *)) {
+                            // TODO: Update when iOS 13 SDK is officially released
+                            if ([controller.extendedGamepad respondsToSelector:@selector(buttonOptions)]) {
+                                optionsButton = [controller.extendedGamepad performSelector:@selector(buttonOptions)];
+                            }
+                        }
+                        
+                        if (optionsButton != nil) {
+                            // Has L3/R3 and Select, so we can show nothing :)
+                            level = OnScreenControlsLevelOff;
+                        }
+                        else {
+                            // Has L3/R3 but no Select button
+                            level = OnScreenControlsLevelAutoGCExtendedGamepadWithStickButtons;
+                        }
+                    }
+                }
                 break;
             }
             else if (controller.gamepad != NULL) {
@@ -268,7 +367,9 @@
         }
     }
     
+#if TARGET_OS_IPHONE
     [_osc setLevel:level];
+#endif
 }
 
 -(void) initAutoOnScreenControlMode:(OnScreenControls*)osc
@@ -285,6 +386,7 @@
             controller.playerIndex = i;
             
             Controller* limeController;
+
             if (i == 0) {
                 // Player 0 shares a controller object with the on-screen controls
                 limeController = _player0osc;
@@ -293,6 +395,8 @@
                 limeController.playerIndex = i;
             }
             
+            //limeController.gamepad = controller;
+
             [_controllers setObject:limeController forKey:[NSNumber numberWithInteger:controller.playerIndex]];
             
             Log(LOG_I, @"Assigning controller index: %d", i);
@@ -301,53 +405,153 @@
     }
 }
 
+#if TARGET_OS_IPHONE
 -(Controller*) getOscController {
     return _player0osc;
 }
+#else
+-(NSMutableDictionary*) getControllers {
+    return _controllers;
+}
 
-+(int) getConnectedGamepadMask {
-    int mask = 0;
+-(void) assignGamepad:(struct Gamepad_device *)gamepad {
+    for (int i = 0; i < 4; i++) {
+        if (!(_controllerNumbers & (1 << i))) {
+            _controllerNumbers |= (1 << i);
+            gamepad->deviceID = i;
+            NSLog(@"Gamepad device id: %u assigned", gamepad->deviceID);
+            Controller* limeController;
+            limeController = [[Controller alloc] init];
+            limeController.playerIndex = i;
+            
+            [_controllers setObject:limeController forKey:[NSNumber numberWithInteger:i]];
+            break;
+        }
+    }
+}
+
+-(void) removeGamepad:(struct Gamepad_device *)gamepad {
+    _controllerNumbers &= ~(1 << gamepad->deviceID);
+    Log(LOG_I, @"Unassigning controller index: %ld", (long)gamepad->deviceID);
     
-    for (int i = 0; i < [[GCController controllers] count]; i++) {
-        mask |= 1 << i;
+    // Inform the server of the updated active gamepads before removing this controller
+    [self updateFinished:[_controllers objectForKey:[NSNumber numberWithInteger:gamepad->deviceID]]];
+    [_controllers removeObjectForKey:[NSNumber numberWithInteger:gamepad->deviceID]];
+}
+#endif
+
++(bool) isSupportedGamepad:(GCController*) controller {
+    return controller.extendedGamepad != nil || controller.gamepad != nil;
+}
+
++(int) getGamepadCount {
+    int count = 0;
+    
+    for (GCController* controller in [GCController controllers]) {
+        if ([ControllerSupport isSupportedGamepad:controller]) {
+            count++;
+        }
     }
     
+    return count;
+}
+
++(int) getConnectedGamepadMask:(StreamConfiguration*)streamConfig {
+    int mask = 0;
+    
+    if (streamConfig.multiController) {
+        int i = 0;
+        for (GCController* controller in [GCController controllers]) {
+            if ([ControllerSupport isSupportedGamepad:controller]) {
+                mask |= 1 << i++;
+            }
+        }
+    }
+    else {
+        // Some games don't deal with having controller reconnected
+        // properly so always report controller 1 if not in MC mode
+        mask = 0x1;
+    }
+    
+#if TARGET_OS_IPHONE
     DataManager* dataMan = [[DataManager alloc] init];
     OnScreenControlsLevel level = (OnScreenControlsLevel)[[dataMan getSettings].onscreenControls integerValue];
     
     // Even if no gamepads are present, we will always count one
     // if OSC is enabled.
     if (level != OnScreenControlsLevelOff) {
-        mask |= 1;
+        mask |= 0x1;
     }
+#endif
     
     return mask;
 }
 
--(id) init
+-(void) rumbleTimer
+{
+    for (int i = 0; i < 4; i++) {
+        Controller* controller = [_controllers objectForKey:[NSNumber numberWithInteger:i]];
+        if (controller == nil && i == 0 && _oscEnabled) {
+            // No physical controller, but we have on-screen controls
+            controller = _player0osc;
+        }
+        if (controller == nil) {
+            // No connected controller for this player
+            continue;
+        }
+        
+        [self rumbleController:controller];
+    }
+}
+
+-(id) initWithConfig:(StreamConfiguration*)streamConfig
 {
     self = [super init];
     
     _controllerStreamLock = [[NSLock alloc] init];
     _controllers = [[NSMutableDictionary alloc] init];
     _controllerNumbers = 0;
+    _multiController = streamConfig.multiController;
+
     _player0osc = [[Controller alloc] init];
     _player0osc.playerIndex = 0;
-    
+
+#if TARGET_OS_IPHONE
     DataManager* dataMan = [[DataManager alloc] init];
     _oscEnabled = (OnScreenControlsLevel)[[dataMan getSettings].onscreenControls integerValue] != OnScreenControlsLevelOff;
+#else
+    _oscEnabled = false;
+    initGamepad(self);
+    Gamepad_detectDevices();
+#endif
     
-    Log(LOG_I, @"Number of controllers connected: %ld", (long)[[GCController controllers] count]);
+    _rumbleTimer = [NSTimer scheduledTimerWithTimeInterval:0.20
+                                                    target:self
+                                                  selector:@selector(rumbleTimer)
+                                                  userInfo:nil
+                                                   repeats:YES];
+    
+    Log(LOG_I, @"Number of supported controllers connected: %d", [ControllerSupport getGamepadCount]);
+    Log(LOG_I, @"Multi-controller: %d", _multiController);
+    
     for (GCController* controller in [GCController controllers]) {
-        [self assignController:controller];
-        [self registerControllerCallbacks:controller];
-        [self updateAutoOnScreenControlMode];
+        if ([ControllerSupport isSupportedGamepad:controller]) {
+            [self assignController:controller];
+            [self registerControllerCallbacks:controller];
+            [self updateAutoOnScreenControlMode];
+        }
     }
     
     self.connectObserver = [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         Log(LOG_I, @"Controller connected!");
         
         GCController* controller = note.object;
+        
+        if (![ControllerSupport isSupportedGamepad:controller]) {
+            // Ignore micro gamepads and motion controllers
+            return;
+        }
+        
         [self assignController:controller];
         
         // Register callbacks on the new controller
@@ -360,29 +564,42 @@
         Log(LOG_I, @"Controller disconnected!");
         
         GCController* controller = note.object;
+        
+        if (![ControllerSupport isSupportedGamepad:controller]) {
+            // Ignore micro gamepads and motion controllers
+            return;
+        }
+        
         [self unregisterControllerCallbacks:controller];
-        _controllerNumbers &= ~(1 << controller.playerIndex);
+        self->_controllerNumbers &= ~(1 << controller.playerIndex);
         Log(LOG_I, @"Unassigning controller index: %ld", (long)controller.playerIndex);
         
-        // Inform the server of the updated active gamepads before removing this controller
-        [self updateFinished:[_controllers objectForKey:[NSNumber numberWithInteger:controller.playerIndex]]];
-        [_controllers removeObjectForKey:[NSNumber numberWithInteger:controller.playerIndex]];
+        // Unset the GCController on this object (in case it is the OSC, which will persist)
+        Controller* limeController = [self->_controllers objectForKey:[NSNumber numberWithInteger:controller.playerIndex]];
+        limeController.gamepad = nil;
         
+        // Inform the server of the updated active gamepads before removing this controller
+        [self updateFinished:limeController];
+        [self->_controllers removeObjectForKey:[NSNumber numberWithInteger:controller.playerIndex]];
+
         // Re-evaluate the on-screen control mode
         [self updateAutoOnScreenControlMode];
     }];
-    
     return self;
 }
 
 -(void) cleanup
 {
+    [_rumbleTimer invalidate];
+    _rumbleTimer = nil;
     [[NSNotificationCenter defaultCenter] removeObserver:self.connectObserver];
     [[NSNotificationCenter defaultCenter] removeObserver:self.disconnectObserver];
     [_controllers removeAllObjects];
     _controllerNumbers = 0;
     for (GCController* controller in [GCController controllers]) {
-        [self unregisterControllerCallbacks:controller];
+        if ([ControllerSupport isSupportedGamepad:controller]) {
+            [self unregisterControllerCallbacks:controller];
+        }
     }
 }
 

@@ -6,8 +6,7 @@
 //  Copyright © 2015 Moonlight Stream. All rights reserved.
 //
 
-#import <Foundation/Foundation.h>
-#import "Settings.h"
+#import "Settings+CoreDataClass.h"
 
 @interface TemporarySettings : NSObject
 
@@ -19,6 +18,12 @@
 @property (nonatomic, retain) NSNumber * width;
 @property (nonatomic, retain) NSNumber * onscreenControls;
 @property (nonatomic, retain) NSString * uniqueId;
+@property (nonatomic) BOOL streamingRemotely;
+@property (nonatomic) BOOL useHevc;
+@property (nonatomic) BOOL multiController;
+@property (nonatomic) BOOL playAudioOnPC;
+@property (nonatomic) BOOL optimizeGames;
+@property (nonatomic) BOOL enableHdr;
 
 - (id) initFromSettings:(Settings*)settings;
 

@@ -15,7 +15,6 @@
 #import "Utils.h"
 #import "UIComputerView.h"
 #import "UIAppView.h"
-#import "SettingsViewController.h"
 #import "DataManager.h"
 #import "TemporarySettings.h"
 #import "WakeOnLanManager.h"
@@ -26,55 +25,72 @@
 #import "ComputerScrollView.h"
 #import "TemporaryApp.h"
 #import "IdManager.h"
+#import "ConnectionHelper.h"
+
+#if !TARGET_OS_TV
+#import "SettingsViewController.h"
+#endif
+
+#import <VideoToolbox/VideoToolbox.h>
 
 @implementation MainFrameViewController {
     NSOperationQueue* _opQueue;
     TemporaryHost* _selectedHost;
     NSString* _uniqueId;
-    NSData* _cert;
+    NSData* _clientCert;
     DiscoveryManager* _discMan;
     AppAssetManager* _appManager;
     StreamConfiguration* _streamConfig;
     UIAlertController* _pairAlert;
+    LoadingFrameViewController* _loadingFrame;
     UIScrollView* hostScrollView;
     int currentPosition;
     NSArray* _sortedAppList;
     NSCache* _boxArtCache;
+    bool _background;
+#if TARGET_OS_TV
+    UITapGestureRecognizer* _menuRecognizer;
+#else
+    UIButton* _pullArrow;
+#endif
 }
 static NSMutableSet* hostList;
 
 - (void)showPIN:(NSString *)PIN {
     dispatch_async(dispatch_get_main_queue(), ^{
-        _pairAlert = [UIAlertController alertControllerWithTitle:@"Pairing"
-                                                         message:[NSString stringWithFormat:@"Enter the following PIN on the host machine: %@", PIN]
-                                                  preferredStyle:UIAlertControllerStyleAlert];
-        [_pairAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleDestructive handler:^(UIAlertAction* action) {
-            _pairAlert = nil;
-            [_discMan startDiscovery];
-            [self hideLoadingFrame];
+        self->_pairAlert = [UIAlertController alertControllerWithTitle:@"Pairing"
+                                                               message:[NSString stringWithFormat:@"Enter the following PIN on the host machine: %@", PIN]
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+        [self->_pairAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleDestructive handler:^(UIAlertAction* action) {
+            self->_pairAlert = nil;
+            [self->_discMan startDiscovery];
+            [self hideLoadingFrame: nil];
         }]];
-        [self presentViewController:_pairAlert animated:YES completion:nil];
+        [[self activeViewController] presentViewController:self->_pairAlert animated:YES completion:nil];
     });
 }
 
 - (void)displayFailureDialog:(NSString *)message {
     UIAlertController* failedDialog = [UIAlertController alertControllerWithTitle:@"Pairing Failed"
-                                                     message:message
-                                              preferredStyle:UIAlertControllerStyleAlert];
-    [failedDialog addAction:[UIAlertAction actionWithTitle:@"Ok" style:UIAlertActionStyleDestructive handler:nil]];
-    [self presentViewController:failedDialog animated:YES completion:nil];
+                                                                          message:message
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+    [Utils addHelpOptionToDialog:failedDialog];
+    [failedDialog addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    
+    [self hideLoadingFrame: ^{
+        [[self activeViewController] presentViewController:failedDialog animated:YES completion:nil];
+    }];
     
     [_discMan startDiscovery];
-    [self hideLoadingFrame];
 }
 
 - (void)pairFailed:(NSString *)message {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (_pairAlert != nil) {
-            [_pairAlert dismissViewControllerAnimated:YES completion:^{
+        if (self->_pairAlert != nil) {
+            [self->_pairAlert dismissViewControllerAnimated:YES completion:^{
                 [self displayFailureDialog:message];
             }];
-            _pairAlert = nil;
+            self->_pairAlert = nil;
         }
         else {
             [self displayFailureDialog:message];
@@ -82,12 +98,15 @@ static NSMutableSet* hostList;
     });
 }
 
-- (void)pairSuccessful {
+- (void)pairSuccessful:(NSData*)serverCert {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [_pairAlert dismissViewControllerAnimated:YES completion:nil];
-        _pairAlert = nil;
-
-        [_discMan startDiscovery];
+        // Store the cert from pairing with the host
+        self->_selectedHost.serverCert = serverCert;
+        
+        [self->_pairAlert dismissViewControllerAnimated:YES completion:nil];
+        self->_pairAlert = nil;
+        
+        [self->_discMan startDiscovery];
         [self alreadyPaired];
     });
 }
@@ -102,57 +121,47 @@ static NSMutableSet* hostList;
     if ([host.appList count] > 0) {
         usingCachedAppList = true;
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (host != _selectedHost) {
+            if (host != self->_selectedHost) {
+                [self hideLoadingFrame: nil];
                 return;
             }
             
-            _computerNameButton.title = host.name;
+#if TARGET_OS_TV
+            self.title = host.name;
+#else
+            self->_computerNameButton.title = host.name;
+#endif
             [self.navigationController.navigationBar setNeedsLayout];
             
             [self updateAppsForHost:host];
-            [self hideLoadingFrame];
+            [self hideLoadingFrame: nil];
         });
     }
     Log(LOG_I, @"Using cached app list: %d", usingCachedAppList);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        HttpManager* hMan = [[HttpManager alloc] initWithHost:host.activeAddress uniqueId:_uniqueId deviceName:deviceName cert:_cert];
-        
         // Exempt this host from discovery while handling the applist query
-        [_discMan removeHostFromDiscovery:host];
+        [self->_discMan removeHostFromDiscovery:host];
         
-        // Try up to 5 times to get the app list
-        AppListResponse* appListResp;
-        for (int i = 0; i < 5; i++) {
-            appListResp = [[AppListResponse alloc] init];
-            [hMan executeRequestSynchronously:[HttpRequest requestForResponse:appListResp withUrlRequest:[hMan newAppListRequest]]];
-            if (appListResp == nil || ![appListResp isStatusOk] || [appListResp getAppList] == nil) {
-                Log(LOG_W, @"Failed to get applist on try %d: %@", i, appListResp.statusMessage);
-                
-                // Wait for one second then retry
-                [NSThread sleepForTimeInterval:1];
-            }
-            else {
-                Log(LOG_I, @"App list successfully retreived - took %d tries", i);
-                break;
-            }
-        }
+        AppListResponse* appListResp = [ConnectionHelper getAppListForHostWithHostIP:host.activeAddress serverCert:host.serverCert uniqueID:self->_uniqueId];
         
-        [_discMan addHostToDiscovery:host];
+        [self->_discMan addHostToDiscovery:host];
 
         if (appListResp == nil || ![appListResp isStatusOk] || [appListResp getAppList] == nil) {
             Log(LOG_W, @"Failed to get applist: %@", appListResp.statusMessage);
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self hideLoadingFrame];
-                
-                if (host != _selectedHost) {
+                if (host != self->_selectedHost) {
+                    [self hideLoadingFrame: nil];
                     return;
                 }
                 
                 UIAlertController* applistAlert = [UIAlertController alertControllerWithTitle:@"Fetching App List Failed"
                                                                                       message:@"The connection to the PC was interrupted."
                                                                                preferredStyle:UIAlertControllerStyleAlert];
-                [applistAlert addAction:[UIAlertAction actionWithTitle:@"Ok" style:UIAlertActionStyleDestructive handler:nil]];
-                [self presentViewController:applistAlert animated:YES completion:nil];
+                [Utils addHelpOptionToDialog:applistAlert];
+                [applistAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [self hideLoadingFrame: ^{
+                    [[self activeViewController] presentViewController:applistAlert animated:YES completion:nil];
+                }];
                 host.online = NO;
                 [self showHostSelectionView];
             });
@@ -160,17 +169,22 @@ static NSMutableSet* hostList;
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self updateApplist:[appListResp getAppList] forHost:host];
 
-                if (host != _selectedHost) {
+                if (host != self->_selectedHost) {
+                    [self hideLoadingFrame: nil];
                     return;
                 }
                 
-                _computerNameButton.title = host.name;
+#if TARGET_OS_TV
+                self.title = host.name;
+#else
+                self->_computerNameButton.title = host.name;
+#endif
                 [self.navigationController.navigationBar setNeedsLayout];
                 
                 [self updateAppsForHost:host];
-                [_appManager stopRetrieving];
-                [_appManager retrieveAssetsFromHost:host];
-                [self hideLoadingFrame];
+                [self->_appManager stopRetrieving];
+                [self->_appManager retrieveAssetsFromHost:host];
+                [self hideLoadingFrame: nil];
             });
         }
     });
@@ -184,6 +198,7 @@ static NSMutableSet* hostList;
         for (TemporaryApp* savedApp in host.appList) {
             if ([app.id isEqualToString:savedApp.id]) {
                 savedApp.name = app.name;
+                savedApp.hdrSupported = app.hdrSupported;
                 appAlreadyInList = YES;
                 break;
             }
@@ -228,9 +243,19 @@ static NSMutableSet* hostList;
 }
 
 - (void)showHostSelectionView {
+#if TARGET_OS_TV
+    // Remove the menu button intercept to allow the app to exit
+    // when at the host selection view.
+    [self.view removeGestureRecognizer:_menuRecognizer];
+#endif
+    
     [_appManager stopRetrieving];
     _selectedHost = nil;
+#if TARGET_OS_TV
+    self.title = @"Select Host";
+#else
     _computerNameButton.title = @"No Host Selected";
+#endif
     [self.collectionView reloadData];
     [self.view addSubview:hostScrollView];
 }
@@ -239,9 +264,6 @@ static NSMutableSet* hostList;
     // Update the box art cache now so we don't have to do it
     // on the main thread
     [self updateBoxArtCacheForApp:app];
-    
-    DataManager* dataManager = [[DataManager alloc] init];
-    [dataManager updateIconForExistingApp: app];
     
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.collectionView reloadData];
@@ -252,8 +274,9 @@ static NSMutableSet* hostList;
     UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"Network Error"
                                                                    message:@"Failed to resolve host."
                                                             preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Ok" style:UIAlertActionStyleDestructive handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
+    [Utils addHelpOptionToDialog:alert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [[self activeViewController] presentViewController:alert animated:YES completion:nil];
 }
 
 - (void) hostClicked:(TemporaryHost *)host view:(UIView *)view {
@@ -270,6 +293,11 @@ static NSMutableSet* hostList;
     _selectedHost = host;
     [self disableNavigation];
     
+#if TARGET_OS_TV
+    // Intercept the menu key to go back to the host page
+    [self.view addGestureRecognizer:_menuRecognizer];
+#endif
+    
     // If we are online, paired, and have a cached app list, skip straight
     // to the app grid without a loading frame. This is the fast path that users
     // should hit most. Check for a valid view because we don't want to hit the fast
@@ -280,48 +308,78 @@ static NSMutableSet* hostList;
         return;
     }
     
-    [self showLoadingFrame];
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        HttpManager* hMan = [[HttpManager alloc] initWithHost:host.activeAddress uniqueId:_uniqueId deviceName:deviceName cert:_cert];
-        ServerInfoResponse* serverInfoResp = [[ServerInfoResponse alloc] init];
-        
-        // Exempt this host from discovery while handling the serverinfo request
-        [_discMan removeHostFromDiscovery:host];
-        [hMan executeRequestSynchronously:[HttpRequest requestForResponse:serverInfoResp withUrlRequest:[hMan newServerInfoRequest]
-                                           fallbackError:401 fallbackRequest:[hMan newHttpServerInfoRequest]]];
-        [_discMan addHostToDiscovery:host];
-        
-        if (serverInfoResp == nil || ![serverInfoResp isStatusOk]) {
-            Log(LOG_W, @"Failed to get server info: %@", serverInfoResp.statusMessage);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self hideLoadingFrame];
-                
-                if (host != _selectedHost) {
-                    return;
-                }
-                
-                UIAlertController* applistAlert = [UIAlertController alertControllerWithTitle:@"Fetching Server Info Failed"
-                                                                                      message:@"The connection to the PC was interrupted."
-                                                                               preferredStyle:UIAlertControllerStyleAlert];
-                [applistAlert addAction:[UIAlertAction actionWithTitle:@"Ok" style:UIAlertActionStyleDestructive handler:nil]];
-                [self presentViewController:applistAlert animated:YES completion:nil];
-                host.online = NO;
-                [self showHostSelectionView];
-            });
-        } else {
-            Log(LOG_D, @"server info pair status: %@", [serverInfoResp getStringTag:@"PairStatus"]);
-            if ([[serverInfoResp getStringTag:@"PairStatus"] isEqualToString:@"1"]) {
-                Log(LOG_I, @"Already Paired");
-                [self alreadyPaired];
+    [self showLoadingFrame: ^{
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            HttpManager* hMan = [[HttpManager alloc] initWithHost:host.activeAddress uniqueId:self->_uniqueId serverCert:host.serverCert];
+            ServerInfoResponse* serverInfoResp = [[ServerInfoResponse alloc] init];
+            
+            // Exempt this host from discovery while handling the serverinfo request
+            [self->_discMan removeHostFromDiscovery:host];
+            [hMan executeRequestSynchronously:[HttpRequest requestForResponse:serverInfoResp withUrlRequest:[hMan newServerInfoRequest:false]
+                                                                fallbackError:401 fallbackRequest:[hMan newHttpServerInfoRequest]]];
+            [self->_discMan addHostToDiscovery:host];
+            
+            if (serverInfoResp == nil || ![serverInfoResp isStatusOk]) {
+                Log(LOG_W, @"Failed to get server info: %@", serverInfoResp.statusMessage);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (host != self->_selectedHost) {
+                        [self hideLoadingFrame:nil];
+                        return;
+                    }
+                    
+                    UIAlertController* applistAlert = [UIAlertController alertControllerWithTitle:@"Fetching Server Info Failed"
+                                                                                          message:@"The connection to the PC was interrupted."
+                                                                                   preferredStyle:UIAlertControllerStyleAlert];
+                    [Utils addHelpOptionToDialog:applistAlert];
+                    [applistAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                    
+                    // Only display an alert if this was the result of a real
+                    // user action, not just passively entering the foreground again
+                    [self hideLoadingFrame: ^{
+                        if (view != nil) {
+                            [[self activeViewController] presentViewController:applistAlert animated:YES completion:nil];
+                        }
+                    }];
+                    
+                    host.online = NO;
+                    [self showHostSelectionView];
+                });
             } else {
-                Log(LOG_I, @"Trying to pair");
-                // Polling the server while pairing causes the server to screw up
-                [_discMan stopDiscoveryBlocking];
-                PairManager* pMan = [[PairManager alloc] initWithManager:hMan andCert:_cert callback:self];
-                [_opQueue addOperation:pMan];
+                // Update the host object with this data
+                [serverInfoResp populateHost:host];
+                if (host.pairState == PairStatePaired) {
+                    Log(LOG_I, @"Already Paired");
+                    [self alreadyPaired];
+                }
+                // Only pair when this was the result of explicit user action
+                else if (view != nil) {
+                    Log(LOG_I, @"Trying to pair");
+                    // Polling the server while pairing causes the server to screw up
+                    [self->_discMan stopDiscoveryBlocking];
+                    PairManager* pMan = [[PairManager alloc] initWithManager:hMan clientCert:self->_clientCert callback:self];
+                    [self->_opQueue addOperation:pMan];
+                }
+                else {
+                    // Not user action, so just return to host screen
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self hideLoadingFrame:^{
+                            [self showHostSelectionView];
+                        }];
+                    });
+                }
             }
-        }
-    });
+        });
+    }];
+}
+
+- (UIViewController*) activeViewController {
+    UIViewController *topController = [UIApplication sharedApplication].keyWindow.rootViewController;
+
+    while (topController.presentedViewController) {
+        topController = topController.presentedViewController;
+    }
+
+    return topController;
 }
 
 - (void)hostLongClicked:(TemporaryHost *)host view:(UIView *)view {
@@ -329,11 +387,9 @@ static NSMutableSet* hostList;
     UIAlertController* longClickAlert = [UIAlertController alertControllerWithTitle:host.name message:@"" preferredStyle:UIAlertControllerStyleActionSheet];
     if (!host.online) {
         [longClickAlert addAction:[UIAlertAction actionWithTitle:@"Wake" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action){
-            UIAlertController* wolAlert = [UIAlertController alertControllerWithTitle:@"Wake On Lan" message:@"" preferredStyle:UIAlertControllerStyleAlert];
+            UIAlertController* wolAlert = [UIAlertController alertControllerWithTitle:@"Wake On LAN" message:@"" preferredStyle:UIAlertControllerStyleAlert];
             [wolAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-            if (host.pairState != PairStatePaired) {
-                wolAlert.message = @"Cannot wake host because you are not paired";
-            } else if (host.mac == nil || [host.mac isEqualToString:@"00:00:00:00:00:00"]) {
+            if (host.mac == nil || [host.mac isEqualToString:@"00:00:00:00:00:00"]) {
                 wolAlert.message = @"Host MAC unknown, unable to send WOL Packet";
             } else {
                 dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -341,11 +397,17 @@ static NSMutableSet* hostList;
                 });
                 wolAlert.message = @"Sent WOL Packet";
             }
-            [self presentViewController:wolAlert animated:YES completion:nil];
+            [[self activeViewController] presentViewController:wolAlert animated:YES completion:nil];
         }]];
+        
+#if !TARGET_OS_TV
+        [longClickAlert addAction:[UIAlertAction actionWithTitle:@"Connection Help" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action){
+            [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/moonlight-stream/moonlight-docs/wiki/Troubleshooting"]];
+        }]];
+#endif
     }
     [longClickAlert addAction:[UIAlertAction actionWithTitle:@"Remove Host" style:UIAlertActionStyleDestructive handler:^(UIAlertAction* action) {
-        [_discMan removeHostFromDiscovery:host];
+        [self->_discMan removeHostFromDiscovery:host];
         DataManager* dataMan = [[DataManager alloc] init];
         [dataMan removeHost:host];
         @synchronized(hostList) {
@@ -360,20 +422,19 @@ static NSMutableSet* hostList;
     longClickAlert.popoverPresentationController.sourceView = view;
     
     longClickAlert.popoverPresentationController.sourceRect = CGRectMake(view.bounds.size.width / 2.0, view.bounds.size.height / 2.0, 1.0, 1.0); // center of the view
-    [self presentViewController:longClickAlert animated:YES completion:^{
+    [[self activeViewController] presentViewController:longClickAlert animated:YES completion:^{
         [self updateHosts];
     }];
 }
 
 - (void) addHostClicked {
     Log(LOG_D, @"Clicked add host");
-    [self showLoadingFrame];
     UIAlertController* alertController = [UIAlertController alertControllerWithTitle:@"Host Address" message:@"Please enter a hostname or IP address" preferredStyle:UIAlertControllerStyleAlert];
     [alertController addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [alertController addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action){
         NSString* hostAddress = ((UITextField*)[[alertController textFields] objectAtIndex:0]).text;
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-            [_discMan discoverHost:hostAddress withCallback:^(TemporaryHost* host, NSString* error){
+            [self->_discMan discoverHost:hostAddress withCallback:^(TemporaryHost* host, NSString* error){
                 if (host != nil) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                         @synchronized(hostList) {
@@ -383,23 +444,24 @@ static NSMutableSet* hostList;
                     });
                 } else {
                     UIAlertController* hostNotFoundAlert = [UIAlertController alertControllerWithTitle:@"Add Host" message:error preferredStyle:UIAlertControllerStyleAlert];
-                    [hostNotFoundAlert addAction:[UIAlertAction actionWithTitle:@"Ok" style:UIAlertActionStyleDestructive handler:nil]];
+                    [Utils addHelpOptionToDialog:hostNotFoundAlert];
+                    [hostNotFoundAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        [self presentViewController:hostNotFoundAlert animated:YES completion:nil];
+                        [[self activeViewController] presentViewController:hostNotFoundAlert animated:YES completion:nil];
                     });
                 }
             }];});
     }]];
     [alertController addTextFieldWithConfigurationHandler:nil];
-    [self hideLoadingFrame];
-    [self presentViewController:alertController animated:YES completion:nil];
+    [[self activeViewController] presentViewController:alertController animated:YES completion:nil];
 }
 
-- (void) appClicked:(TemporaryApp *)app {
-    Log(LOG_D, @"Clicked app: %@", app.name);
+- (void) prepareToStreamApp:(TemporaryApp *)app {
     _streamConfig = [[StreamConfiguration alloc] init];
     _streamConfig.host = app.host.activeAddress;
     _streamConfig.appID = app.id;
+    _streamConfig.appName = app.name;
+    _streamConfig.serverCert = app.host.serverCert;
     
     DataManager* dataMan = [[DataManager alloc] init];
     TemporarySettings* streamSettings = [dataMan getSettings];
@@ -408,13 +470,48 @@ static NSMutableSet* hostList;
     _streamConfig.bitRate = [streamSettings.bitrate intValue];
     _streamConfig.height = [streamSettings.height intValue];
     _streamConfig.width = [streamSettings.width intValue];
-    _streamConfig.gamepadMask = [ControllerSupport getConnectedGamepadMask];
+    _streamConfig.streamingRemotely = streamSettings.streamingRemotely;
+    _streamConfig.optimizeGameSettings = streamSettings.optimizeGames;
+    _streamConfig.playAudioOnPC = streamSettings.playAudioOnPC;
+    _streamConfig.allowHevc = streamSettings.useHevc;
+    
+    // multiController must be set before calling getConnectedGamepadMask
+    _streamConfig.multiController = streamSettings.multiController;
+    _streamConfig.gamepadMask = [ControllerSupport getConnectedGamepadMask:_streamConfig];
+    
+    // TODO: Detect attached surround sound system then address 5.1 TODOs
+    // in Connection.m
+    _streamConfig.audioChannelCount = 2;
+    _streamConfig.audioChannelMask = 0x3;
+    
+    // HDR requires HDR10 game, HDR10 display, and HEVC Main10 decoder on the client.
+    // It additionally requires an HEVC Main10 encoder on the server (GTX 1000+).
+    //
+    // It should also be a user preference, since some games may require higher peak
+    // brightness than the iOS device can support to look correct in HDR mode.
+    if (@available(iOS 11.3, *)) {
+        _streamConfig.enableHdr =
+            app.hdrSupported && // App supported
+            (app.host.serverCodecModeSupport & 0x200) != 0 && // HEVC Main10 encoding on host PC GPU
+            VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) && // Decoder supported
+            (AVPlayer.availableHDRModes & AVPlayerHDRModeHDR10) != 0 && // Display supported
+            streamSettings.enableHdr; // User wants it enabled
+    }
+}
+
+- (void) appClicked:(TemporaryApp *)app {
+    Log(LOG_D, @"Clicked app: %@", app.name);
     
     [_appManager stopRetrieving];
     
+#if !TARGET_OS_TV
     if (currentPosition != FrontViewPositionLeft) {
-        [[self revealViewController] revealToggle:self];
+        // This must not be animated because we need the position
+        // to change (and notify our callback to save settings data)
+        // before we call prepareToStreamApp.
+        [[self revealViewController] revealToggleAnimated:NO];
     }
+#endif
     
     TemporaryApp* currentApp = [self findRunningApp:app.host];
     if (currentApp != nil) {
@@ -424,71 +521,85 @@ static NSMutableSet* hostList;
         [alertController addAction:[UIAlertAction
                                     actionWithTitle:[app.id isEqualToString:currentApp.id] ? @"Resume App" : @"Resume Running App" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action){
                                         Log(LOG_I, @"Resuming application: %@", currentApp.name);
+                                        [self prepareToStreamApp:currentApp];
                                         [self performSegueWithIdentifier:@"createStreamFrame" sender:nil];
                                     }]];
         [alertController addAction:[UIAlertAction actionWithTitle:
                                     [app.id isEqualToString:currentApp.id] ? @"Quit App" : @"Quit Running App and Start" style:UIAlertActionStyleDestructive handler:^(UIAlertAction* action){
                                         Log(LOG_I, @"Quitting application: %@", currentApp.name);
-                                        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                                            HttpManager* hMan = [[HttpManager alloc] initWithHost:app.host.activeAddress uniqueId:_uniqueId deviceName:deviceName cert:_cert];
-                                            HttpResponse* quitResponse = [[HttpResponse alloc] init];
-                                            HttpRequest* quitRequest = [HttpRequest requestForResponse: quitResponse withUrlRequest:[hMan newQuitAppRequest]];
-                                            
-                                            // Exempt this host from discovery while handling the quit operation
-                                            [_discMan removeHostFromDiscovery:app.host];
-                                            [hMan executeRequestSynchronously:quitRequest];
-                                            if (quitResponse.statusCode == 200) {
-                                                ServerInfoResponse* serverInfoResp = [[ServerInfoResponse alloc] init];
-                                                [hMan executeRequestSynchronously:[HttpRequest requestForResponse:serverInfoResp withUrlRequest:[hMan newServerInfoRequest]
-                                                                                                            fallbackError:401 fallbackRequest:[hMan newHttpServerInfoRequest]]];
-                                                if (![serverInfoResp isStatusOk] || [[serverInfoResp getStringTag:@"state"] hasSuffix:@"_SERVER_BUSY"]) {
-                                                    // On newer GFE versions, the quit request succeeds even though the app doesn't
-                                                    // really quit if another client tries to kill your app. We'll patch the response
-                                                    // to look like the old error in that case, so the UI behaves.
-                                                    quitResponse.statusCode = 599;
-                                                }
-                                            }
-                                            [_discMan addHostToDiscovery:app.host];
-                                            
-                                            UIAlertController* alert;
-                                            
-                                            // If it fails, display an error and stop the current operation
-                                            if (quitResponse.statusCode != 200) {
-                                               alert = [UIAlertController alertControllerWithTitle:@"Quitting App Failed"
-                                                                                      message:@"Failed to quit app. If this app was started by "
-                                                        "another device, you'll need to quit from that device."
-                                                                               preferredStyle:UIAlertControllerStyleAlert];
-                                            }
-                                            // If it succeeds and we're to start streaming, segue to the stream and return
-                                            else if (![app.id isEqualToString:currentApp.id]) {
-                                                app.host.currentGame = @"0";
+                                        [self showLoadingFrame: ^{
+                                            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                                                HttpManager* hMan = [[HttpManager alloc] initWithHost:app.host.activeAddress uniqueId:self->_uniqueId serverCert:app.host.serverCert];
+                                                HttpResponse* quitResponse = [[HttpResponse alloc] init];
+                                                HttpRequest* quitRequest = [HttpRequest requestForResponse: quitResponse withUrlRequest:[hMan newQuitAppRequest]];
                                                 
+                                                // Exempt this host from discovery while handling the quit operation
+                                                [self->_discMan removeHostFromDiscovery:app.host];
+                                                [hMan executeRequestSynchronously:quitRequest];
+                                                if (quitResponse.statusCode == 200) {
+                                                    ServerInfoResponse* serverInfoResp = [[ServerInfoResponse alloc] init];
+                                                    [hMan executeRequestSynchronously:[HttpRequest requestForResponse:serverInfoResp withUrlRequest:[hMan newServerInfoRequest:false]
+                                                                                                        fallbackError:401 fallbackRequest:[hMan newHttpServerInfoRequest]]];
+                                                    if (![serverInfoResp isStatusOk] || [[serverInfoResp getStringTag:@"state"] hasSuffix:@"_SERVER_BUSY"]) {
+                                                        // On newer GFE versions, the quit request succeeds even though the app doesn't
+                                                        // really quit if another client tries to kill your app. We'll patch the response
+                                                        // to look like the old error in that case, so the UI behaves.
+                                                        quitResponse.statusCode = 599;
+                                                    }
+                                                    else if ([serverInfoResp isStatusOk]) {
+                                                        // Update the host object with this info
+                                                        [serverInfoResp populateHost:app.host];
+                                                    }
+                                                }
+                                                [self->_discMan addHostToDiscovery:app.host];
+                                                
+                                                UIAlertController* alert;
+                                                
+                                                // If it fails, display an error and stop the current operation
+                                                if (quitResponse.statusCode != 200) {
+                                                    alert = [UIAlertController alertControllerWithTitle:@"Quitting App Failed"
+                                                                                                message:@"Failed to quit app. If this app was started by "
+                                                             "another device, you'll need to quit from that device."
+                                                                                         preferredStyle:UIAlertControllerStyleAlert];
+                                                }
+                                                // If it succeeds and we're to start streaming, segue to the stream and return
+                                                else if (![app.id isEqualToString:currentApp.id]) {
+                                                    app.host.currentGame = @"0";
+                                                    
+                                                    dispatch_async(dispatch_get_main_queue(), ^{
+                                                        [self updateAppsForHost:app.host];
+                                                        [self prepareToStreamApp:app];
+                                                        [self hideLoadingFrame: ^{
+                                                            [self performSegueWithIdentifier:@"createStreamFrame" sender:nil];
+                                                        }];
+                                                    });
+                                                    
+                                                    return;
+                                                }
+                                                // Otherwise, display a dialog to notify the user that the app was quit
+                                                else {
+                                                    app.host.currentGame = @"0";
+                                                    
+                                                    alert = [UIAlertController alertControllerWithTitle:@"Quitting App"
+                                                                                                message:@"The app was quit successfully."
+                                                                                         preferredStyle:UIAlertControllerStyleAlert];
+                                                }
+                                                
+                                                [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                                                 dispatch_async(dispatch_get_main_queue(), ^{
                                                     [self updateAppsForHost:app.host];
-                                                    [self performSegueWithIdentifier:@"createStreamFrame" sender:nil];
+                                                    [self hideLoadingFrame: ^{
+                                                        [[self activeViewController] presentViewController:alert animated:YES completion:nil];
+                                                    }];
                                                 });
-                                                
-                                                return;
-                                            }
-                                            // Otherwise, display a dialog to notify the user that the app was quit
-                                            else {
-                                                app.host.currentGame = @"0";
-                                                
-                                                alert = [UIAlertController alertControllerWithTitle:@"Quitting App"
-                                                                                            message:@"The app was quit successfully."
-                                                                                     preferredStyle:UIAlertControllerStyleAlert];
-                                            }
-                                            
-                                            [alert addAction:[UIAlertAction actionWithTitle:@"Ok" style:UIAlertActionStyleDestructive handler:nil]];
-                                            dispatch_async(dispatch_get_main_queue(), ^{
-                                                [self updateAppsForHost:app.host];
-                                                [self presentViewController:alert animated:YES completion:nil];
                                             });
-                                        });
+                                        }];
+                                        
                                     }]];
         [alertController addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        [self presentViewController:alertController animated:YES completion:nil];
+        [[self activeViewController] presentViewController:alertController animated:YES completion:nil];
     } else {
+        [self prepareToStreamApp:app];
         [self performSegueWithIdentifier:@"createStreamFrame" sender:nil];
     }
 }
@@ -502,13 +613,46 @@ static NSMutableSet* hostList;
     return nil;
 }
 
+#if !TARGET_OS_TV
 - (void)revealController:(SWRevealViewController *)revealController didMoveToPosition:(FrontViewPosition)position {
     // If we moved back to the center position, we should save the settings
     if (position == FrontViewPositionLeft) {
         [(SettingsViewController*)[revealController rearViewController] saveSettings];
     }
+    
+    // Fade out the pull arrow
+    [UIView animateWithDuration:0.1
+                     animations:^{
+                         self->_pullArrow.alpha = 0.0;
+                     }
+                     completion:^(BOOL finished) {
+                         // Flip the direction of the arrow
+                         if (position == FrontViewPositionLeft) {
+                             // Change the pull arrow back to the default rotation
+                             self->_pullArrow.imageView.transform = CGAffineTransformMakeRotation(0);
+                         }
+                         else {
+                             // Flip the pull arrow when the reveal is toggled
+                             self->_pullArrow.imageView.transform = CGAffineTransformMakeRotation(M_PI);
+                         }
+                         
+                         // Fade it back in
+                         [UIView animateWithDuration:0.2
+                                          animations:^{
+                                              self->_pullArrow.alpha = 1.0;
+                                          }
+                                          completion:nil];
+                     }];
+    
     currentPosition = position;
 }
+#endif
+
+#if TARGET_OS_TV
+- (void)collectionView:(UICollectionView *)collectionView didSelectItemAtIndexPath:(NSIndexPath *)indexPath {
+    [self appClicked:_sortedAppList[indexPath.row]];
+}
+#endif
 
 - (void)prepareForSegue:(UIStoryboardSegue *)segue sender:(id)sender {
     if ([segue.destinationViewController isKindOfClass:[StreamFrameViewController class]]) {
@@ -517,20 +661,20 @@ static NSMutableSet* hostList;
     }
 }
 
-- (void) showLoadingFrame {
-    LoadingFrameViewController* loadingFrame = [self.storyboard instantiateViewControllerWithIdentifier:@"loadingFrame"];
-    [self.navigationController presentViewController:loadingFrame animated:YES completion:nil];
+- (void) showLoadingFrame:(void (^)(void))completion {
+    [_loadingFrame showLoadingFrame:completion];
 }
 
-- (void) hideLoadingFrame {
-    [self dismissViewControllerAnimated:YES completion:nil];
+- (void) hideLoadingFrame:(void (^)(void))completion {
     [self enableNavigation];
+    [_loadingFrame dismissLoadingFrame:completion];
 }
 
 - (void)viewDidLoad
 {
     [super viewDidLoad];
     
+#if !TARGET_OS_TV
     // Set the side bar button action. When it's tapped, it'll show the sidebar.
     [_limelightLogoButton addTarget:self.revealViewController action:@selector(revealToggle:) forControlEvents:UIControlEventTouchDown];
     
@@ -543,14 +687,25 @@ static NSMutableSet* hostList;
     
     // Get callbacks associated with the viewController
     [self.revealViewController setDelegate:self];
+#else
+    _menuRecognizer = [[UITapGestureRecognizer alloc] init];
+    [_menuRecognizer addTarget:self action: @selector(showHostSelectionView)];
+    _menuRecognizer.allowedPressTypes = [[NSArray alloc] initWithObjects:[NSNumber numberWithLong:UIPressTypeMenu], nil];
+    
+    self.navigationController.navigationBar.titleTextAttributes = [NSDictionary dictionaryWithObject:[UIColor whiteColor] forKey:NSForegroundColorAttributeName];
+    
+    self.title = @"Select Host";
+#endif
+    
+    _loadingFrame = [self.storyboard instantiateViewControllerWithIdentifier:@"loadingFrame"];
     
     // Set the current position to the center
     currentPosition = FrontViewPositionLeft;
     
     // Set up crypto
-    [CryptoManager generateKeyPairUsingSSl];
+    [CryptoManager generateKeyPairUsingSSL];
     _uniqueId = [IdManager getUniqueId];
-    _cert = [CryptoManager readCertFromFile];
+    _clientCert = [CryptoManager readCertFromFile];
 
     _appManager = [[AppAssetManager alloc] initWithCallback:self];
     _opQueue = [[NSOperationQueue alloc] init];
@@ -569,50 +724,68 @@ static NSMutableSet* hostList;
     [hostScrollView setShowsHorizontalScrollIndicator:NO];
     hostScrollView.delaysContentTouches = NO;
     
-    UIButton* pullArrow = [[UIButton alloc] init];
-    [pullArrow addTarget:self.revealViewController action:@selector(revealToggle:) forControlEvents:UIControlEventTouchDown];
-    [pullArrow setImage:[UIImage imageNamed:@"PullArrow"] forState:UIControlStateNormal];
-    [pullArrow sizeToFit];
-    pullArrow.frame = CGRectMake(0,
-                                 self.collectionView.frame.size.height / 6 - pullArrow.frame.size.height / 2 - self.navigationController.navigationBar.frame.size.height,
-                                 pullArrow.frame.size.width,
-                                 pullArrow.frame.size.height);
+#if !TARGET_OS_TV
+    _pullArrow = [[UIButton alloc] init];
+    [_pullArrow addTarget:self.revealViewController action:@selector(revealToggle:) forControlEvents:UIControlEventTouchDown];
+    [_pullArrow setImage:[UIImage imageNamed:@"PullArrow"] forState:UIControlStateNormal];
+    [_pullArrow sizeToFit];
+    _pullArrow.frame = CGRectMake(0,
+                                  self.collectionView.frame.size.height / 6 - _pullArrow.frame.size.height / 2 - self.navigationController.navigationBar.frame.size.height,
+                                  _pullArrow.frame.size.width,
+                                  _pullArrow.frame.size.height);
+#endif
     
     self.collectionView.delaysContentTouches = NO;
     self.collectionView.allowsMultipleSelection = NO;
+#if !TARGET_OS_TV
     self.collectionView.multipleTouchEnabled = NO;
+#endif
     
     [self retrieveSavedHosts];
     _discMan = [[DiscoveryManager alloc] initWithHosts:[hostList allObjects] andCallback:self];
     
-    [[NSNotificationCenter defaultCenter] addObserver: self
-                                             selector: @selector(handleReturnToForeground)
-                                                 name: UIApplicationWillEnterForegroundNotification
-                                               object: nil];
-    
-    [self updateHosts];
     [self.view addSubview:hostScrollView];
-    [self.view addSubview:pullArrow];
+#if !TARGET_OS_TV
+    [self.view addSubview:_pullArrow];
+#endif
 }
 
--(void)dealloc
+-(void)beginForegroundRefresh:(bool)refreshAppList
 {
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    if (!_background) {
+        // This will kick off box art caching
+        [self updateHosts];
+        
+        [_discMan startDiscovery];
+        
+        // This will refresh the applist when a paired host is selected
+        if (refreshAppList && _selectedHost != nil && _selectedHost.pairState == PairStatePaired) {
+            [self hostClicked:_selectedHost view:nil];
+        }
+    }
 }
 
 -(void)handleReturnToForeground
 {
-    // This will refresh the applist when a paired host is selected
-    if (_selectedHost != nil && _selectedHost.pairState == PairStatePaired) {
-        [self hostClicked:_selectedHost view:nil];
-    }
+    _background = NO;
+    
+    [self beginForegroundRefresh: YES];
+}
+
+-(void)handleEnterBackground
+{
+    _background = YES;
+    
+    [_discMan stopDiscovery];
 }
 
 - (void)viewDidAppear:(BOOL)animated
 {
     [super viewDidAppear:animated];
     
+#if !TARGET_OS_TV
     [[self revealViewController] setPrimaryViewController:self];
+#endif
     
     [self.navigationController setNavigationBarHidden:NO animated:YES];
     
@@ -621,19 +794,54 @@ static NSMutableSet* hostList;
     [self.navigationController.navigationBar setShadowImage:fakeImage];
     [self.navigationController.navigationBar setBackgroundImage:fakeImage forBarPosition:UIBarPositionAny barMetrics:UIBarMetricsDefault];
     
-    [_discMan startDiscovery];
+    [[NSNotificationCenter defaultCenter] addObserver: self
+                                             selector: @selector(handleReturnToForeground)
+                                                 name: UIApplicationDidBecomeActiveNotification
+                                               object: nil];
     
-    [self handleReturnToForeground];
+    [[NSNotificationCenter defaultCenter] addObserver: self
+                                             selector: @selector(handleEnterBackground)
+                                                 name: UIApplicationWillResignActiveNotification
+                                               object: nil];
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    
+    // We can get here on home press while streaming
+    // since the stream view segues to us just before
+    // entering the background. We can't check the app
+    // state here (since it's in transition), so we have
+    // to use this function that will use our internal
+    // state here to determine whether we're foreground.
+    //
+    // Note that this is neccessary here as we may enter
+    // this view via an error dialog from the stream
+    // view, so we won't get a return to active notification
+    // for that which would normally fire beginForegroundRefresh.
+    //
+    // On tvOS, we'll get a viewWillAppear when returning from the
+    // loading frame which will cause an infinite loop by starting
+    // another loading frame. To avoid this, just don't refresh
+    // if we're coming back from a loading frame view.
+    [self beginForegroundRefresh: !([_loadingFrame isShown] || [_loadingFrame isBeingDismissed])];
 }
 
 - (void)viewDidDisappear:(BOOL)animated
 {
     [super viewDidDisappear:animated];
-    // when discovery stops, we must create a new instance because you cannot restart an NSOperation when it is finished
+    
+    // when discovery stops, we must create a new instance because
+    // you cannot restart an NSOperation when it is finished
     [_discMan stopDiscovery];
     
     // Purge the box art cache
     [_boxArtCache removeAllObjects];
+    
+    // Remove our lifetime observers to avoid triggering them
+    // while streaming
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 - (void) retrieveSavedHosts {
@@ -685,6 +893,13 @@ static NSMutableSet* hostList;
             compView.center = CGPointMake([self getCompViewX:compView addComp:addComp prevEdge:prevEdge], hostScrollView.frame.size.height / 2);
             prevEdge = compView.frame.origin.x + compView.frame.size.width;
             [hostScrollView addSubview:compView];
+            
+            // Start jobs to decode the box art in advance
+            for (TemporaryApp* app in comp.appList) {
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+                    [self updateBoxArtCacheForApp:app];
+                });
+            }
         }
     }
     
@@ -706,11 +921,33 @@ static NSMutableSet* hostList;
 // This function forces immediate decoding of the UIImage, rather
 // than the default lazy decoding that results in janky scrolling.
 + (UIImage*) loadBoxArtForCaching:(TemporaryApp*)app {
+    UIImage* boxArt;
     
-    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)app.image, NULL);
-    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, (__bridge CFDictionaryRef)@{(id)kCGImageSourceShouldCacheImmediately: (id)kCFBooleanTrue});
+    NSData* imageData = [NSData dataWithContentsOfFile:[AppAssetManager boxArtPathForApp:app]];
+    if (imageData == nil) {
+        // No box art on disk
+        return nil;
+    }
     
-    UIImage *boxArt = [UIImage imageWithCGImage:cgImage];
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)imageData, NULL);
+    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil);
+    
+    size_t width = CGImageGetWidth(cgImage);
+    size_t height = CGImageGetHeight(cgImage);
+    
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef imageContext =  CGBitmapContextCreate(NULL, width, height, 8, width * 4, colorSpace,
+                                                       kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGColorSpaceRelease(colorSpace);
+
+    CGContextDrawImage(imageContext, CGRectMake(0, 0, width, height), cgImage);
+    
+    CGImageRef outputImage = CGBitmapContextCreateImage(imageContext);
+
+    boxArt = [UIImage imageWithCGImage:outputImage];
+    
+    CGImageRelease(outputImage);
+    CGContextRelease(imageContext);
     
     CGImageRelease(cgImage);
     CFRelease(source);
@@ -719,11 +956,12 @@ static NSMutableSet* hostList;
 }
 
 - (void) updateBoxArtCacheForApp:(TemporaryApp*)app {
-    if (app.image == nil) {
-        [_boxArtCache removeObjectForKey:app];
-    }
-    else if ([_boxArtCache objectForKey:app] == nil) {
-        [_boxArtCache setObject:[MainFrameViewController loadBoxArtForCaching:app] forKey:app];
+    if ([_boxArtCache objectForKey:app] == nil) {
+        UIImage* image = [MainFrameViewController loadBoxArtForCaching:app];
+        if (image != nil) {
+            // Add the image to our cache if it was present
+            [_boxArtCache setObject:image forKey:app];
+        }
     }
 }
 
@@ -736,33 +974,6 @@ static NSMutableSet* hostList;
     _sortedAppList = [host.appList allObjects];
     _sortedAppList = [_sortedAppList sortedArrayUsingSelector:@selector(compareName:)];
     
-    // Split the sorted array in half to allow 2 jobs to process app assets at once
-    NSArray *firstHalf;
-    NSArray *secondHalf;
-    NSRange range;
-    
-    range.location = 0;
-    range.length = [_sortedAppList count] / 2;
-    
-    firstHalf = [_sortedAppList subarrayWithRange:range];
-    
-    range.location = range.length;
-    range.length = [_sortedAppList count] - range.length;
-    
-    secondHalf = [_sortedAppList subarrayWithRange:range];
-    
-    // Start 2 jobs
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        for (TemporaryApp* app in firstHalf) {
-            [self updateBoxArtCacheForApp:app];
-        }
-    });
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        for (TemporaryApp* app in secondHalf) {
-            [self updateBoxArtCacheForApp:app];
-        }
-    });
-    
     [hostScrollView removeFromSuperview];
     [self.collectionView reloadData];
 }
@@ -772,7 +983,6 @@ static NSMutableSet* hostList;
     
     TemporaryApp* app = _sortedAppList[indexPath.row];
     UIAppView* appView = [[UIAppView alloc] initWithApp:app cache:_boxArtCache andCallback:self];
-    [appView updateAppImage];
     
     if (appView.bounds.size.width > 10.0) {
         CGFloat scale = cell.bounds.size.width / appView.bounds.size.width;
@@ -791,9 +1001,11 @@ static NSMutableSet* hostList;
     cell.layer.shadowOpacity = 0.5f;
     cell.layer.shadowPath = shadowPath.CGPath;
     
-    cell.layer.borderColor = [[UIColor colorWithRed:0 green:0 blue:0 alpha:0.3f] CGColor];
+#if !TARGET_OS_TV
     cell.layer.borderWidth = 1;
+    cell.layer.borderColor = [[UIColor colorWithRed:0 green:0 blue:0 alpha:0.3f] CGColor];
     cell.exclusiveTouch = YES;
+#endif
 
     return cell;
 }
@@ -814,7 +1026,9 @@ static NSMutableSet* hostList;
 - (void)didReceiveMemoryWarning
 {
     [super didReceiveMemoryWarning];
-    // Dispose of any resources that can be recreated.
+    
+    // Purge the box art cache on low memory
+    [_boxArtCache removeAllObjects];
 }
 
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
@@ -826,9 +1040,11 @@ static NSMutableSet* hostList;
     return YES;
 }
 
+#if !TARGET_OS_TV
 - (BOOL)shouldAutorotate {
     return YES;
 }
+#endif
 
 - (void) disableNavigation {
     self.navigationController.navigationBar.topItem.rightBarButtonItem.enabled = NO;
@@ -836,6 +1052,22 @@ static NSMutableSet* hostList;
 
 - (void) enableNavigation {
     self.navigationController.navigationBar.topItem.rightBarButtonItem.enabled = YES;
+}
+
+#if TARGET_OS_TV
+- (BOOL)canBecomeFocused {
+    return YES;
+}
+#endif
+
+- (void)didUpdateFocusInContext:(UIFocusUpdateContext *)context withAnimationCoordinator:(UIFocusAnimationCoordinator *)coordinator {
+    
+#if !TARGET_OS_TV
+    if (context.nextFocusedView != nil) {
+        [context.nextFocusedView setAlpha:0.8];
+    }
+    [context.previouslyFocusedView setAlpha:1.0];
+#endif
 }
 
 @end

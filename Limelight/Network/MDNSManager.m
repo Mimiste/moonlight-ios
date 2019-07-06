@@ -9,11 +9,15 @@
 #import "MDNSManager.h"
 #import "TemporaryHost.h"
 
+#include <arpa/inet.h>
+
+#include <Limelight.h>
+
 @implementation MDNSManager {
     NSNetServiceBrowser* mDNSBrowser;
-    NSMutableArray* domains;
     NSMutableArray* services;
     BOOL scanActive;
+    BOOL timerPending;
 }
 
 static NSString* NV_SERVICE_TYPE = @"_nvstream._tcp";
@@ -23,43 +27,65 @@ static NSString* NV_SERVICE_TYPE = @"_nvstream._tcp";
     
     self.callback = callback;
     
+    scanActive = FALSE;
+    
     mDNSBrowser = [[NSNetServiceBrowser alloc] init];
     [mDNSBrowser setDelegate:self];
     
-    domains = [[NSMutableArray alloc] init];
     services = [[NSMutableArray alloc] init];
     
     return self;
 }
 
 - (void) searchForHosts {
+    if (scanActive) {
+        return;
+    }
+    
     Log(LOG_I, @"Starting mDNS discovery");
     scanActive = TRUE;
-    [mDNSBrowser searchForServicesOfType:NV_SERVICE_TYPE inDomain:@""];
+
+    if (!timerPending) {
+        timerPending = TRUE;
+
+        // Just invoke the timer callback to save a little code
+        [self startSearchTimerCallback:nil];
+    }
 }
 
 - (void) stopSearching {
+    if (!scanActive) {
+        return;
+    }
+    
     Log(LOG_I, @"Stopping mDNS discovery");
     scanActive = FALSE;
     [mDNSBrowser stop];
 }
 
-- (NSArray*) getFoundHosts {
-    NSMutableArray* hosts = [[NSMutableArray alloc] init];
-    for (NSNetService* service in services) {
-        if (service.hostName != nil) {
-            TemporaryHost* host = [[TemporaryHost alloc] init];
-            host.activeAddress = host.localAddress = service.hostName;
-            host.name = service.hostName;
-            [hosts addObject:host];
-        }
-    }
-    return hosts;
-}
-
 - (void)netServiceDidResolveAddress:(NSNetService *)service {
-    Log(LOG_I, @"Resolved address: %@ -> %@", service, service.hostName);
-    [self.callback updateHosts:[self getFoundHosts]];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        Log(LOG_D, @"Resolved address: %@ -> %@", service, service.hostName);
+        TemporaryHost* host = [[TemporaryHost alloc] init];
+        
+        // Since we discovered this host over mDNS, we know we're on the same network
+        // as the PC and we can use our current WAN address as a likely candidate
+        // for our PC's external address.
+        struct in_addr wanAddr;
+        int err = LiFindExternalAddressIP4("stun.moonlight-stream.org", 3478, &wanAddr.s_addr);
+        if (err == 0) {
+            char addrStr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &wanAddr, addrStr, sizeof(addrStr));
+            host.externalAddress = [NSString stringWithFormat: @"%s", addrStr];
+        }
+        else {
+            Log(LOG_E, @"STUN failed to get WAN address: %d", err);
+        }
+        
+        host.activeAddress = host.localAddress = service.hostName;
+        host.name = service.hostName;
+        [self.callback updateHost:host];
+    });
 }
 
 - (void)netService:(NSNetService *)sender didNotResolve:(NSDictionary *)errorDict {
@@ -74,12 +100,14 @@ static NSString* NV_SERVICE_TYPE = @"_nvstream._tcp";
 }
 
 - (void)netServiceBrowser:(NSNetServiceBrowser *)aNetServiceBrowser didFindService:(NSNetService *)aNetService moreComing:(BOOL)moreComing {
-    Log(LOG_I, @"Found service: %@", aNetService);
-    [aNetService setDelegate:self];
-    [aNetService resolveWithTimeout:5];
+    Log(LOG_D, @"Found service: %@", aNetService);
     
-    [services removeObject:aNetService];
-    [services addObject:aNetService];
+    if (![services containsObject:aNetService]) {
+        Log(LOG_I, @"Found new host: %@", aNetService.name);
+        [aNetService setDelegate:self];
+        [aNetService resolveWithTimeout:5];
+        [services addObject:aNetService];
+    }
 }
 
 - (void)netServiceBrowser:(NSNetServiceBrowser *)aNetServiceBrowser didRemoveService:(NSNetService *)aNetService moreComing:(BOOL)moreComing {
@@ -90,23 +118,29 @@ static NSString* NV_SERVICE_TYPE = @"_nvstream._tcp";
 - (void)netServiceBrowser:(NSNetServiceBrowser *)aNetServiceBrowser didNotSearch:(NSDictionary *)errorDict {
     Log(LOG_W, @"Did not perform search: \n%@", [errorDict description]);
     
-    // Schedule a retry in 2 seconds
-    [NSTimer scheduledTimerWithTimeInterval:2.0
-                                     target:self
-                                   selector:@selector(retrySearchTimerCallback:)
-                                   userInfo:nil
-                                    repeats:NO];
+    // We'll schedule a retry in startSearchTimerCallback
 }
 
-- (void)retrySearchTimerCallback:(NSTimer *)timer {
+- (void)startSearchTimerCallback:(NSTimer *)timer {
     // Check if we've been stopped since this was queued
     if (!scanActive) {
+        timerPending = FALSE;
         return;
     }
     
-    Log(LOG_I, @"Retrying mDNS search");
+    Log(LOG_D, @"Restarting mDNS search");
     [mDNSBrowser stop];
     [mDNSBrowser searchForServicesOfType:NV_SERVICE_TYPE inDomain:@""];
+    
+    // Search again in 5 seconds. We need to do this because
+    // we want more aggressive querying than Bonjour will normally
+    // do for when we're at the hosts screen. This also covers scenarios
+    // where discovery didn't work, like if WiFi was disabled.
+    [NSTimer scheduledTimerWithTimeInterval:5.0
+                                     target:self
+                                   selector:@selector(startSearchTimerCallback:)
+                                   userInfo:nil
+                                    repeats:NO];
 }
 
 - (void)retryResolveTimerCallback:(NSTimer *)timer {

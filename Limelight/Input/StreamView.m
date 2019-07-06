@@ -11,6 +11,7 @@
 #import "OnScreenControls.h"
 #import "DataManager.h"
 #import "ControllerSupport.h"
+#import "KeyboardSupport.h"
 #import "keyboard_translation.h"
 
 #define SYSBARBUTTON(ITEM, SELECTOR) [[UIBarButtonItem alloc] initWithBarButtonSystemItem:ITEM target:self action:SELECTOR]
@@ -21,12 +22,15 @@
     BOOL touchMoved;
     OnScreenControls* onScreenControls;
     
+    BOOL isInputingText;
     BOOL isDragging;
     NSTimer* dragTimer;
     
     float xDeltaFactor;
     float yDeltaFactor;
     float screenFactor;
+    
+    NSDictionary<NSString *, NSNumber *> *dictCodes;
 }
 
 - (void) setMouseDeltaFactors:(float)x y:(float)y {
@@ -48,6 +52,7 @@
         Log(LOG_I, @"Setting manual on-screen controls level: %d", (int)level);
         [onScreenControls setLevel:level];
     }
+    [self becomeFirstResponder];
 }
 
 - (Boolean)isConfirmedMove:(CGPoint)currentPoint from:(CGPoint)originalPoint {
@@ -134,34 +139,52 @@
     if (![onScreenControls handleTouchUpEvent:touches]) {
         [dragTimer invalidate];
         dragTimer = nil;
-        if (!touchMoved) {
-            if ([[event allTouches] count]  == 3) {
-                Log(LOG_D, @"Opening the keyboard");
-                //Prepare the textbox used to capture entered characters
-                _textToSend.delegate = self;
-                _textToSend.text = @"0";
-                [_textToSend becomeFirstResponder];
-                [_textToSend addTarget:self action:@selector(onKeyboardPressed:) forControlEvents:UIControlEventEditingChanged];
-            } else if ([[event allTouches] count]  == 2) {
-                Log(LOG_D, @"Sending right mouse button press");
-                
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_RIGHT);
-                
-                // Wait 100 ms to simulate a real button press
-                usleep(100 * 1000);
-                
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
-            } else {
-                if (!isDragging){
-                    Log(LOG_D, @"Sending left mouse button press");
+        if (isDragging) {
+            isDragging = false;
+            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+        } else if (!touchMoved) {
+            if ([[event allTouches] count] == 3) {
+                if (isInputingText) {
+                    Log(LOG_D, @"Closing the keyboard");
+                    [_keyInputField resignFirstResponder];
+                    isInputingText = false;
+                } else {
+                    Log(LOG_D, @"Opening the keyboard");
+                    // Prepare the textbox used to capture keyboard events.
+                    _keyInputField.delegate = self;
+                    _keyInputField.text = @"0";
+                    [_keyInputField becomeFirstResponder];
+                    [_keyInputField addTarget:self action:@selector(onKeyboardPressed:) forControlEvents:UIControlEventEditingChanged];
                     
-                    LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
+                    // Undo causes issues for our state management, so turn it off
+                    [_keyInputField.undoManager disableUndoRegistration];
+                    
+                    isInputingText = true;
+                }
+            } else if ([[event allTouches] count]  == 2) {
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                    Log(LOG_D, @"Sending right mouse button press");
+                    
+                    LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_RIGHT);
                     
                     // Wait 100 ms to simulate a real button press
                     usleep(100 * 1000);
-                }
-                isDragging = false;
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+                    
+                    LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+                });
+            } else if ([[event allTouches] count]  == 1) {
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                    if (!self->isDragging){
+                        Log(LOG_D, @"Sending left mouse button press");
+                        
+                        LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
+                        
+                        // Wait 100 ms to simulate a real button press
+                        usleep(100 * 1000);
+                    }
+                    self->isDragging = false;
+                    LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+                });
             }
         }
         
@@ -198,56 +221,116 @@
 - (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event {
 }
 
-- (BOOL)textFieldShouldReturn:(UITextField *)textToSend {
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    // This method is called when the "Return" key is pressed.
     LiSendKeyboardEvent(0x0d, KEY_ACTION_DOWN, 0);
-    usleep(100 * 1000);
+    usleep(50 * 1000);
     LiSendKeyboardEvent(0x0d, KEY_ACTION_UP, 0);
+    return NO;
+}
+
+- (void)onKeyboardPressed:(UITextField *)textField {
+    NSString* inputText = textField.text;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        // If the text became empty, we know the user pressed the backspace key.
+        if ([inputText isEqual:@""]) {
+            LiSendKeyboardEvent(0x08, KEY_ACTION_DOWN, 0);
+            usleep(50 * 1000);
+            LiSendKeyboardEvent(0x08, KEY_ACTION_UP, 0);
+        } else {
+            // Character 0 will be our known sentinel value
+            for (int i = 1; i < [inputText length]; i++) {
+                struct KeyEvent event = [KeyboardSupport translateKeyEvent:[inputText characterAtIndex:i] withModifierFlags:0];
+                if (event.keycode == 0) {
+                    // If we don't know the code, don't send anything.
+                    Log(LOG_W, @"Unknown key code: [%c]", [inputText characterAtIndex:i]);
+                    continue;
+                }
+                [self sendLowLevelEvent:event];
+            }
+        }
+    });
+    
+    // Reset text field back to known state
+    textField.text = @"0";
+    
+    // Move the insertion point back to the end of the text box
+    UITextRange *textRange = [textField textRangeFromPosition:textField.endOfDocument toPosition:textField.endOfDocument];
+    [textField setSelectedTextRange:textRange];
+}
+
+- (void)specialCharPressed:(UIKeyCommand *)cmd {
+    struct KeyEvent event = [KeyboardSupport translateKeyEvent:0x20 withModifierFlags:[cmd modifierFlags]];
+    event.keycode = [[dictCodes valueForKey:[cmd input]] intValue];
+    [self sendLowLevelEvent:event];
+}
+
+- (void)keyPressed:(UIKeyCommand *)cmd {
+    struct KeyEvent event = [KeyboardSupport translateKeyEvent:[[cmd input] characterAtIndex:0] withModifierFlags:[cmd modifierFlags]];
+    [self sendLowLevelEvent:event];
+}
+
+- (void)sendLowLevelEvent:(struct KeyEvent)event {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        // When we want to send a modified key (like uppercase letters) we need to send the
+        // modifier ("shift") seperately from the key itself.
+        if (event.modifier != 0) {
+            LiSendKeyboardEvent(event.modifierKeycode, KEY_ACTION_DOWN, event.modifier);
+        }
+        LiSendKeyboardEvent(event.keycode, KEY_ACTION_DOWN, event.modifier);
+        usleep(50 * 1000);
+        LiSendKeyboardEvent(event.keycode, KEY_ACTION_UP, event.modifier);
+        if (event.modifier != 0) {
+            LiSendKeyboardEvent(event.modifierKeycode, KEY_ACTION_UP, event.modifier);
+        }
+    });
+}
+
+- (BOOL)canBecomeFirstResponder {
     return YES;
 }
 
-//Capture the keycode of the last entered character in the textToSend Textfield, translate it and send it to GFE
--(void)onKeyboardPressed :(UITextField *)textToSend{
-    struct translatedKeycode keyCodeStructure;
-    if ([textToSend.text  isEqual: @""]){
-        //If the textfield is empty, send a BACKSPACE
-        keyCodeStructure.keycode = 8;
-        keyCodeStructure.modifier = 0;
-    } else {
-        //Translate the keycode of the last entered character
-        short keyCode = [textToSend.text characterAtIndex:1];
-        if (keyCode != 8226) { // bullet hides the keyboard
-            keyCodeStructure = translateKeycode(keyCode);
-        } else {
-            [_textToSend endEditing:YES];
-        }
+- (NSArray<UIKeyCommand *> *)keyCommands
+{
+    NSString *charset = @"qwertyuiopasdfghjklzxcvbnm1234567890\t§[]\\'\"/.,`<>-´ç+`¡'º;ñ= ";
+    
+    NSMutableArray<UIKeyCommand *> * commands = [NSMutableArray<UIKeyCommand *> array];
+    dictCodes = [[NSDictionary alloc] initWithObjectsAndKeys: [NSNumber numberWithInt: 0x0d], @"\r", [NSNumber numberWithInt: 0x08], @"\b", [NSNumber numberWithInt: 0x1b], UIKeyInputEscape, [NSNumber numberWithInt: 0x28], UIKeyInputDownArrow, [NSNumber numberWithInt: 0x26], UIKeyInputUpArrow, [NSNumber numberWithInt: 0x25], UIKeyInputLeftArrow, [NSNumber numberWithInt: 0x27], UIKeyInputRightArrow, nil];
+    
+    [charset enumerateSubstringsInRange:NSMakeRange(0, charset.length)
+                                options:NSStringEnumerationByComposedCharacterSequences
+                             usingBlock:^(NSString *substring, NSRange substringRange, NSRange enclosingRange, BOOL *stop) {
+                                 [commands addObject:[UIKeyCommand keyCommandWithInput:substring modifierFlags:0 action:@selector(keyPressed:)]];
+                                 [commands addObject:[UIKeyCommand keyCommandWithInput:substring modifierFlags:UIKeyModifierShift action:@selector(keyPressed:)]];
+                                 [commands addObject:[UIKeyCommand keyCommandWithInput:substring modifierFlags:UIKeyModifierControl action:@selector(keyPressed:)]];
+                                 [commands addObject:[UIKeyCommand keyCommandWithInput:substring modifierFlags:UIKeyModifierAlternate action:@selector(keyPressed:)]];
+                             }];
+    
+    for (NSString *c in [dictCodes keyEnumerator]) {
+        [commands addObject:[UIKeyCommand keyCommandWithInput:c
+                                                modifierFlags:0
+                                                       action:@selector(specialCharPressed:)]];
+        [commands addObject:[UIKeyCommand keyCommandWithInput:c
+                                                modifierFlags:UIKeyModifierShift
+                                                       action:@selector(specialCharPressed:)]];
+        [commands addObject:[UIKeyCommand keyCommandWithInput:c
+                                                modifierFlags:UIKeyModifierShift | UIKeyModifierAlternate
+                                                       action:@selector(specialCharPressed:)]];
+        [commands addObject:[UIKeyCommand keyCommandWithInput:c
+                                                modifierFlags:UIKeyModifierShift | UIKeyModifierControl
+                                                       action:@selector(specialCharPressed:)]];
+        [commands addObject:[UIKeyCommand keyCommandWithInput:c
+                                                modifierFlags:UIKeyModifierControl
+                                                       action:@selector(specialCharPressed:)]];
+        [commands addObject:[UIKeyCommand keyCommandWithInput:c
+                                                modifierFlags:UIKeyModifierControl | UIKeyModifierAlternate
+                                                       action:@selector(specialCharPressed:)]];
+        [commands addObject:[UIKeyCommand keyCommandWithInput:c
+                                                modifierFlags:UIKeyModifierAlternate
+                                                       action:@selector(specialCharPressed:)]];
     }
-    //Send the keycode
-    LiSendKeyboardEvent(keyCodeStructure.keycode, KEY_ACTION_DOWN, keyCodeStructure.modifier);
-    usleep(100 * 1000);
-    LiSendKeyboardEvent(keyCodeStructure.keycode, KEY_ACTION_UP, keyCodeStructure.modifier);
-    textToSend.text = @"0";
-}
-
-- (void)textFieldDidBeginEditing:(UITextField *)sender {
-    [sender.undoManager disableUndoRegistration];
-}
-
-- (BOOL)canPerformAction:(SEL)action withSender:(UITextField *)sender {
-    if (action == @selector(paste:) ||
-        action == @selector(cut:) ||
-        action == @selector(copy:) ||
-        action == @selector(select:) ||
-        action == @selector(selectAll:) ||
-        action == @selector(delete:) ||
-        action == @selector(makeTextWritingDirectionLeftToRight:) ||
-        action == @selector(makeTextWritingDirectionRightToLeft:) ||
-        action == @selector(toggleBoldface:) ||
-        action == @selector(toggleItalics:) ||
-        action == @selector(toggleUnderline:)
-        ) {
-        return NO;
-    }
-    return [super canPerformAction:action withSender:sender];
+    
+    return commands;
 }
 
 @end

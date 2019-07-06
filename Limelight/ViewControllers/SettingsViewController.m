@@ -10,17 +10,80 @@
 #import "TemporarySettings.h"
 #import "DataManager.h"
 
-#define BITRATE_INTERVAL 500 // in kbps
+#import <VideoToolbox/VideoToolbox.h>
 
 @implementation SettingsViewController {
     NSInteger _bitrate;
     Boolean _adjustedForSafeArea;
 }
 static NSString* bitrateFormat = @"Bitrate: %.1f Mbps";
+static const int bitrateTable[] = {
+    500,
+    1000,
+    1500,
+    2000,
+    2500,
+    3000,
+    4000,
+    5000,
+    6000,
+    7000,
+    8000,
+    9000,
+    10000,
+    12000,
+    15000,
+    18000,
+    20000,
+    30000,
+    40000,
+    50000,
+    60000,
+    70000,
+    80000,
+    100000
+};
 
-- (void)viewDidAppear:(BOOL)animated
-{
-    [super viewDidAppear:animated];
+-(int)getSliderValueForBitrate:(NSInteger)bitrate {
+    int i;
+    
+    for (i = 0; i < (sizeof(bitrateTable) / sizeof(*bitrateTable)); i++) {
+        if (bitrate <= bitrateTable[i]) {
+            return i;
+        }
+    }
+    
+    // Return the last entry in the table
+    return i - 1;
+}
+
+-(void)viewDidLayoutSubviews {
+    // On iPhone layouts, this view is rooted at a ScrollView. To make it
+    // scrollable, we'll update content size here.
+    if (self.scrollView != nil) {
+        CGFloat highestViewY = 0;
+        
+        // Enumerate the scroll view's subviews looking for the
+        // highest view Y value to set our scroll view's content
+        // size.
+        for (UIView* view in self.scrollView.subviews) {
+            // UIScrollViews have 2 default UIImageView children
+            // which represent the horizontal and vertical scrolling
+            // indicators. Ignore these when computing content size.
+            if ([view isKindOfClass:[UIImageView class]]) {
+                continue;
+            }
+            
+            CGFloat currentViewY = view.frame.origin.y + view.frame.size.height;
+            if (currentViewY > highestViewY) {
+                highestViewY = currentViewY;
+            }
+        }
+        
+        // Add a bit of padding so the view doesn't end right at the button of the display
+        self.scrollView.contentSize = CGSizeMake(self.scrollView.contentSize.width,
+                                                 highestViewY + 20);
+    }
     
     // Adjust the subviews for the safe area on the iPhone X.
     if (!_adjustedForSafeArea) {
@@ -45,55 +108,138 @@ static NSString* bitrateFormat = @"Bitrate: %.1f Mbps";
     DataManager* dataMan = [[DataManager alloc] init];
     TemporarySettings* currentSettings = [dataMan getSettings];
     
-    // Bitrate is persisted in kbps
-    _bitrate = [currentSettings.bitrate integerValue];
-    NSInteger framerate = [currentSettings.framerate integerValue] == 30 ? 0 : 1;
-    NSInteger resolution;
-    if ([currentSettings.height integerValue] == 720) {
-        resolution = 0;
-    } else if ([currentSettings.height integerValue] == 1080) {
-        resolution = 1;
-    } else {
-        resolution = 0;
-    }
-    NSInteger onscreenControls = [currentSettings.onscreenControls integerValue];
+    // Ensure we pick a bitrate that falls exactly onto a slider notch
+    _bitrate = bitrateTable[[self getSliderValueForBitrate:[currentSettings.bitrate intValue]]];
     
+    NSInteger framerate;
+    switch ([currentSettings.framerate integerValue]) {
+        case 30:
+            framerate = 0;
+            break;
+        default:
+        case 60:
+            framerate = 1;
+            break;
+        case 120:
+            framerate = 2;
+            break;
+    }
+    NSInteger resolution;
+    switch ([currentSettings.height integerValue]) {
+        case 360:
+            resolution = 0;
+            break;
+        default:
+        case 720:
+            resolution = 1;
+            break;
+        case 1080:
+            resolution = 2;
+            break;
+        case 2160:
+            resolution = 3;
+            break;
+    }
+    
+    // Only show the 120 FPS option if we have a > 60-ish Hz display
+    bool enable120Fps = false;
+    if (@available(iOS 10.3, tvOS 10.3, *)) {
+        if ([UIScreen mainScreen].maximumFramesPerSecond > 62) {
+            enable120Fps = true;
+        }
+    }
+    if (!enable120Fps) {
+        [self.framerateSelector removeSegmentAtIndex:2 animated:NO];
+    }
+    
+    // Only show the 4K option for "recent" devices. We'll judge that by whether
+    // they support HEVC decoding (A9 or later).
+    if (@available(iOS 11.0, tvOS 11.0, *)) {
+        if (!VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)) {
+            [self.resolutionSelector removeSegmentAtIndex:3 animated:NO];
+        }
+    }
+    else {
+        [self.resolutionSelector removeSegmentAtIndex:3 animated:NO];
+    }
+    
+    // Disable the HEVC selector if HEVC is not supported by the hardware
+    // or the version of iOS. See comment in Connection.m for reasoning behind
+    // the iOS 11.3 check.
+    if (@available(iOS 11.3, tvOS 11.3, *)) {
+        if (VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)) {
+            [self.hevcSelector setSelectedSegmentIndex:currentSettings.useHevc ? 1 : 0];
+        }
+        else {
+            [self.hevcSelector removeAllSegments];
+            [self.hevcSelector insertSegmentWithTitle:@"Unsupported on this device" atIndex:0 animated:NO];
+            [self.hevcSelector setEnabled:NO];
+        }
+    }
+    else {
+        [self.hevcSelector removeAllSegments];
+        [self.hevcSelector insertSegmentWithTitle:@"Requires iOS 11.3 or later" atIndex:0 animated:NO];
+        [self.hevcSelector setEnabled:NO];
+    }
+    
+    [self.optimizeSettingsSelector setSelectedSegmentIndex:currentSettings.optimizeGames ? 1 : 0];
+    [self.multiControllerSelector setSelectedSegmentIndex:currentSettings.multiController ? 1 : 0];
+    [self.audioOnPCSelector setSelectedSegmentIndex:currentSettings.playAudioOnPC ? 1 : 0];
+    NSInteger onscreenControls = [currentSettings.onscreenControls integerValue];
     [self.resolutionSelector setSelectedSegmentIndex:resolution];
     [self.resolutionSelector addTarget:self action:@selector(newResolutionFpsChosen) forControlEvents:UIControlEventValueChanged];
     [self.framerateSelector setSelectedSegmentIndex:framerate];
     [self.framerateSelector addTarget:self action:@selector(newResolutionFpsChosen) forControlEvents:UIControlEventValueChanged];
     [self.onscreenControlSelector setSelectedSegmentIndex:onscreenControls];
-    [self.bitrateSlider setValue:(_bitrate / BITRATE_INTERVAL) animated:YES];
+    [self.bitrateSlider setMinimumValue:0];
+    [self.bitrateSlider setMaximumValue:(sizeof(bitrateTable) / sizeof(*bitrateTable)) - 1];
+    [self.bitrateSlider setValue:[self getSliderValueForBitrate:_bitrate] animated:YES];
     [self.bitrateSlider addTarget:self action:@selector(bitrateSliderMoved) forControlEvents:UIControlEventValueChanged];
     [self updateBitrateText];
 }
 
 - (void) newResolutionFpsChosen {
-    NSInteger frameRate = [self getChosenFrameRate];
-    NSInteger resHeight = [self getChosenStreamHeight];
+    NSInteger fps = [self getChosenFrameRate];
+    NSInteger width = [self getChosenStreamWidth];
+    NSInteger height = [self getChosenStreamHeight];
     NSInteger defaultBitrate;
     
-    // 1080p60 is 20 Mbps
-    if (frameRate == 60 && resHeight == 1080) {
-        defaultBitrate = 20000;
+    // This table prefers 16:10 resolutions because they are
+    // only slightly more pixels than the 16:9 equivalents, so
+    // we don't want to bump those 16:10 resolutions up to the
+    // next 16:9 slot.
+    //
+    // This logic is shamelessly stolen from Moonlight Qt:
+    // https://github.com/moonlight-stream/moonlight-qt/blob/master/app/settings/streamingpreferences.cpp
+    
+    if (width * height <= 640 * 360) {
+        defaultBitrate = 1000 * (fps / 30.0);
     }
-    // 720p60 and 1080p30 are 10 Mbps
-    else if (frameRate == 60 || resHeight == 1080) {
-        defaultBitrate = 10000;
+    // This covers 1280x720 and 1280x800 too
+    else if (width * height <= 1366 * 768) {
+        defaultBitrate = 5000 * (fps / 30.0);
     }
-    // 720p30 is 5 Mbps
-    else {
-        defaultBitrate = 5000;
+    else if (width * height <= 1920 * 1200) {
+        defaultBitrate = 10000 * (fps / 30.0);
+    }
+    else if (width * height <= 2560 * 1600) {
+        defaultBitrate = 20000 * (fps / 30.0);
+    }
+    else /* if (width * height <= 3840 * 2160) */ {
+        defaultBitrate = 40000 * (fps / 30.0);
     }
     
-    _bitrate = defaultBitrate;
-    [self.bitrateSlider setValue:defaultBitrate / BITRATE_INTERVAL animated:YES];
+    // We should always be exactly on a slider position with default bitrates
+    _bitrate = MIN(defaultBitrate, 100000);
+    assert(bitrateTable[[self getSliderValueForBitrate:_bitrate]] == _bitrate);
+    [self.bitrateSlider setValue:[self getSliderValueForBitrate:_bitrate] animated:YES];
     
     [self updateBitrateText];
 }
 
 - (void) bitrateSliderMoved {
-    _bitrate = BITRATE_INTERVAL * (int)self.bitrateSlider.value;
+    assert(self.bitrateSlider.value < (sizeof(bitrateTable) / sizeof(*bitrateTable)));
+    _bitrate = bitrateTable[(int)self.bitrateSlider.value];
     [self updateBitrateText];
 }
 
@@ -103,15 +249,26 @@ static NSString* bitrateFormat = @"Bitrate: %.1f Mbps";
 }
 
 - (NSInteger) getChosenFrameRate {
-    return [self.framerateSelector selectedSegmentIndex] == 0 ? 30 : 60;
+    switch ([self.framerateSelector selectedSegmentIndex]) {
+        case 0:
+            return 30;
+        case 1:
+            return 60;
+        case 2:
+            return 120;
+        default:
+            abort();
+    }
 }
 
 - (NSInteger) getChosenStreamHeight {
-    return [self.resolutionSelector selectedSegmentIndex] == 0 ? 720 : 1080;
+    const int resolutionTable[] = { 360, 720, 1080, 2160 };
+    return resolutionTable[[self.resolutionSelector selectedSegmentIndex]];
 }
 
 - (NSInteger) getChosenStreamWidth {
-    return [self getChosenStreamHeight] == 720 ? 1280 : 1920;
+    // Assumes fixed 16:9 aspect ratio
+    return ([self getChosenStreamHeight] * 16) / 9;
 }
 
 - (void) saveSettings {
@@ -120,7 +277,21 @@ static NSString* bitrateFormat = @"Bitrate: %.1f Mbps";
     NSInteger height = [self getChosenStreamHeight];
     NSInteger width = [self getChosenStreamWidth];
     NSInteger onscreenControls = [self.onscreenControlSelector selectedSegmentIndex];
-    [dataMan saveSettingsWithBitrate:_bitrate framerate:framerate height:height width:width onscreenControls:onscreenControls];
+    BOOL optimizeGames = [self.optimizeSettingsSelector selectedSegmentIndex] == 1;
+    BOOL multiController = [self.multiControllerSelector selectedSegmentIndex] == 1;
+    BOOL audioOnPC = [self.audioOnPCSelector selectedSegmentIndex] == 1;
+    BOOL useHevc = [self.hevcSelector selectedSegmentIndex] == 1;
+    [dataMan saveSettingsWithBitrate:_bitrate
+                           framerate:framerate
+                              height:height
+                               width:width
+                    onscreenControls:onscreenControls
+                              remote:NO
+                       optimizeGames:optimizeGames
+                     multiController:multiController
+                           audioOnPC:audioOnPC
+                             useHevc:useHevc
+                           enableHdr:NO];
 }
 
 - (void)didReceiveMemoryWarning {

@@ -19,6 +19,7 @@
 static const char* TAG_APP = "App";
 static const char* TAG_APP_TITLE = "AppTitle";
 static const char* TAG_APP_ID = "ID";
+static const char* TAG_HDR_SUPPORTED = "IsHdrSupported";
 
 - (void)populateWithData:(NSData *)xml {
     self.data = xml;
@@ -66,19 +67,24 @@ static const char* TAG_APP_ID = "ID";
             xmlNodePtr appInfoNode = node->xmlChildrenNode;
             NSString* appName = @"";
             NSString* appId = nil;
+            NSString* hdrSupported = @"0";
             while (appInfoNode != NULL) {
                 if (!xmlStrcmp(appInfoNode->name, (xmlChar*)TAG_APP_TITLE)) {
                     xmlChar* nodeVal = xmlNodeListGetString(docPtr, appInfoNode->xmlChildrenNode, 1);
                     if (nodeVal != NULL) {
                         appName = [[NSString alloc] initWithCString:(const char*)nodeVal encoding:NSUTF8StringEncoding];
                         xmlFree(nodeVal);
-                    } else {
-                        appName = @"";
                     }
                 } else if (!xmlStrcmp(appInfoNode->name, (xmlChar*)TAG_APP_ID)) {
                     xmlChar* nodeVal = xmlNodeListGetString(docPtr, appInfoNode->xmlChildrenNode, 1);
                     if (nodeVal != NULL) {
                         appId = [[NSString alloc] initWithCString:(const char*)nodeVal encoding:NSUTF8StringEncoding];
+                        xmlFree(nodeVal);
+                    }
+                } else if (!xmlStrcmp(appInfoNode->name, (xmlChar*)TAG_HDR_SUPPORTED)) {
+                    xmlChar* nodeVal = xmlNodeListGetString(docPtr, appInfoNode->xmlChildrenNode, 1);
+                    if (nodeVal != NULL) {
+                        hdrSupported = [[NSString alloc] initWithCString:(const char*)nodeVal encoding:NSUTF8StringEncoding];
                         xmlFree(nodeVal);
                     }
                 }
@@ -88,6 +94,7 @@ static const char* TAG_APP_ID = "ID";
                 TemporaryApp* app = [[TemporaryApp alloc] init];
                 app.name = appName;
                 app.id = appId;
+                app.hdrSupported = [hdrSupported intValue] != 0;
                 [_appList addObject:app];
             }
         }
@@ -95,6 +102,38 @@ static const char* TAG_APP_ID = "ID";
     }
     
     xmlFreeDoc(docPtr);
+    
+    // APP STORE REVIEW COMPLIANCE
+    //
+    // Remove default Steam entry from the app list to comply with Apple App Store Guideline 4.2.7d:
+    //
+    // The UI appearing on the client does not resemble an iOS or App Store view, does not provide a store-like interface,
+    // or include the ability to browse, select, or purchase software not already owned or licensed by the user.
+    //
+    // However, if the user manually adds Steam themselves, then we will display it.
+    TemporaryApp* officialSteamApp = nil;
+    TemporaryApp* manuallyAddedSteamApp = nil;
+    for (TemporaryApp* app in _appList) {
+        // The official Steam app is marked as HDR supported, while manually added ones are not.
+        if ([app.name isEqualToString:@"Steam"] && app.hdrSupported) {
+            officialSteamApp = app;
+        }
+        else if ([app.name containsString:@"steam"] || [app.name containsString:@"Steam"]) {
+            manuallyAddedSteamApp = app;
+        }
+    }
+    
+    // To be safe, don't do anything if we didn't find an HDR-enabled Steam app.
+    if (officialSteamApp != nil) {
+        // If we didn't find a manually added Steam app, remove the official one to
+        // comply with the App Store guidelines.
+        if (manuallyAddedSteamApp == nil) {
+            [_appList removeObject:officialSteamApp];
+        }
+        else {
+            [_appList removeObject:manuallyAddedSteamApp];
+        }
+    }
 }
 
 - (NSSet*) getAppList {

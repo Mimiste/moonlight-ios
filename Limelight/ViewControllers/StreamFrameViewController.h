@@ -12,8 +12,15 @@
 
 #import <UIKit/UIKit.h>
 
+#if TARGET_OS_TV
+@import GameController;
+
+@interface StreamFrameViewController : GCEventViewController <ConnectionCallbacks, EdgeDetectionDelegate>
+#else
 @interface StreamFrameViewController : UIViewController <ConnectionCallbacks, EdgeDetectionDelegate>
+#endif
 @property (strong, nonatomic) IBOutlet UILabel *stageLabel;
+@property (strong, nonatomic) IBOutlet UILabel *tipLabel;
 @property (strong, nonatomic) IBOutlet UIActivityIndicatorView *spinner;
 @property (nonatomic) StreamConfiguration* streamConfig;
 
