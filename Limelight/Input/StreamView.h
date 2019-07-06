@@ -17,8 +17,11 @@
 @interface StreamView : OSView <UITextFieldDelegate>
 
 @property (nonatomic, retain) IBOutlet UITextField* keyInputField;
+//@interface StreamView : UIView <UITextFieldDelegate>
 
 - (void) setupOnScreenControls:(ControllerSupport*)controllerSupport swipeDelegate:(id<EdgeDetectionDelegate>)swipeDelegate;
 - (void) setMouseDeltaFactors:(float)x y:(float)y;
+
+@property (nonatomic, retain) IBOutlet UITextField* textToSend;
 
 @end

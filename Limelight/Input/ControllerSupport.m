@@ -395,7 +395,7 @@
                 limeController.playerIndex = i;
             }
             
-            limeController.gamepad = controller;
+            //limeController.gamepad = controller;
 
             [_controllers setObject:limeController forKey:[NSNumber numberWithInteger:controller.playerIndex]];
             

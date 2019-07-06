@@ -71,7 +71,7 @@
     NSMutableArray* _deadTouches;
 }
 
-static const float EDGE_WIDTH = .05;
+static const float EDGE_WIDTH = .02;
 
 //static const float BUTTON_SIZE = 50;
 static const float BUTTON_DIST = 20;
@@ -82,7 +82,7 @@ static const float D_PAD_DIST = 10;
 static float D_PAD_CENTER_X;
 static float D_PAD_CENTER_Y;
 
-static const float DEAD_ZONE_PADDING = 15;
+static const float DEAD_ZONE_PADDING = .02;
 
 static const double STICK_CLICK_RATE = 100;
 static const float STICK_DEAD_ZONE = .1;
@@ -212,11 +212,13 @@ static float L3_Y;
             [self hideSticks];
             break;
         case OnScreenControlsLevelSimple:
-            [self setupSimpleControls];
+            [self setupExtendedGamepadControls];
             
             [self hideTriggers];
             [self hideL3R3];
             [self hideBumpers];
+            [self hideTriggers];
+            [self drawStartSelect];
             [self hideSticks];
             [self drawStartSelect];
             [self drawButtons];
@@ -930,12 +932,12 @@ static float L3_Y;
                      startX:_view.frame.origin.x
                      startY:_l3Button.frame.origin.y
                        endX:_view.frame.origin.x
-                       endY:_view.frame.origin.y + _view.frame.size.height]
+                       endY:_view.frame.origin.y]
     || [self isDeadZone:touch
                  startX:_r3Button.frame.origin.x
                  startY:_r3Button.frame.origin.y
                    endX:_view.frame.origin.x + _view.frame.size.width
-                   endY:_view.frame.origin.y + _view.frame.size.height];
+                   endY:_view.frame.origin.y];
 }
 
 - (BOOL) isStartSelectDeadZone:(UITouch*) touch {

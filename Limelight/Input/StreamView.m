@@ -12,6 +12,10 @@
 #import "DataManager.h"
 #import "ControllerSupport.h"
 #import "KeyboardSupport.h"
+#import "keyboard_translation.h"
+
+#define SYSBARBUTTON(ITEM, SELECTOR) [[UIBarButtonItem alloc] initWithBarButtonSystemItem:ITEM target:self action:SELECTOR]
+#define SYSBARBUTTON_TARGET(ITEM, TARGET, SELECTOR) [[UIBarButtonItem alloc] initWithBarButtonSystemItem:ITEM target:TARGET action:SELECTOR]
 
 @implementation StreamView {
     CGPoint touchLocation, originalLocation;
@@ -121,6 +125,10 @@
             }
             
             touchLocation = avgLocation;
+        } else if ([[event allTouches] count] == 3 && !isDragging) {
+            //Invalidate the drag timer, the keyboard will be opened on release
+            [dragTimer invalidate];
+            dragTimer = nil;
         }
     }
     
@@ -178,6 +186,20 @@
                     LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
                 });
             }
+        }
+        
+        // We we're moving from 2+ touches to 1. Synchronize the current position
+        // of the active finger so we don't jump unexpectedly on the next touchesMoved
+        // callback when finger 1 switches on us.
+        if ([[event allTouches] count] - [touches count] == 1) {
+            NSMutableSet *activeSet = [[NSMutableSet alloc] initWithCapacity:[[event allTouches] count]];
+            [activeSet unionSet:[event allTouches]];
+            [activeSet minusSet:touches];
+            touchLocation = [[activeSet anyObject] locationInView:self];
+            
+            // Mark this touch as moved so we don't send a left mouse click if the user
+            // right clicks without moving their other finger.
+            touchMoved = true;
         }
         
         // We we're moving from 2+ touches to 1. Synchronize the current position
@@ -312,3 +334,4 @@
 }
 
 @end
+
