@@ -31,6 +31,7 @@
 #endif
 
 @property (nonatomic, retain) IBOutlet UITextField* keyInputField;
+//@interface StreamView : UIView <UITextFieldDelegate>
 
 - (void) setupStreamView:(ControllerSupport*)controllerSupport
            swipeDelegate:(id<EdgeDetectionDelegate>)swipeDelegate
@@ -38,5 +39,7 @@
                   config:(StreamConfiguration*)streamConfig;
 - (void) showOnScreenControls;
 - (OnScreenControlsLevel) getCurrentOscState;
+
+@property (nonatomic, retain) IBOutlet UITextField* textToSend;
 
 @end

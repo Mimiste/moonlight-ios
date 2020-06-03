@@ -401,6 +401,7 @@
                     limeController.supportedEmulationFlags &= ~EMULATING_SELECT;
                 }
             }
+            //limeController.gamepad = controller;
 
             [_controllers setObject:limeController forKey:[NSNumber numberWithInteger:controller.playerIndex]];
             
